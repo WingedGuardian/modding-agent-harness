@@ -25,6 +25,10 @@ CI artifacts retain source identities, policy hashes, measured test logs, and
 per-job queue/execution times. Missing timing metadata is reported as unavailable;
 it cannot create a successful qualification result.
 
+Reports exclude authentication and raw pull-request text. The API credential is
+used only for metadata requests; retained reports contain source identities and
+job results, not the request environment or event body.
+
 Targeted shared policy checks:
 
     python -B -m unittest discover -s ci/tests -v
