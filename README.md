@@ -135,3 +135,7 @@ New metadata uses complete descriptor writes, fsync and independent size/hash
 readback before no-clobber publication. Incomplete or corrupted transaction,
 review and rollback-plan staging cannot become authoritative. Save preservation
 also retains its separate final manifest/blob verification.
+
+## Development CI
+
+Start with a draft pull request for fast checks. Mark it ready for complete qualification; see [Contributing](CONTRIBUTING.md).
