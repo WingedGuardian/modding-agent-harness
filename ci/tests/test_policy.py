@@ -142,6 +142,13 @@ class CliTests(unittest.TestCase):
             with patch.dict(os.environ, env, clear=True):
                 self.assertEqual(policy.main(["verify", "--profile", "core"]), 1)
 
+    def test_draft_cannot_create_a_successful_merge_gate(self):
+        with tempfile.TemporaryDirectory() as owned:
+            env = self.env(Path(owned), True)
+            env.update(CI_REQUIRED_JOBS='["fast"]',CI_NEEDS_JSON='{"fast":{"result":"success"}}')
+            with patch.dict(os.environ, env, clear=True):
+                self.assertEqual(policy.main(["verify", "--profile", "core"]), 1)
+
     def test_timing_failure_is_visible_and_cannot_supply_a_qualification_verdict(self):
         with tempfile.TemporaryDirectory() as owned:
             folder = Path(owned)

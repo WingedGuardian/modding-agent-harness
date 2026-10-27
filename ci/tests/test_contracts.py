@@ -21,8 +21,17 @@ class ContractTests(unittest.TestCase):
 
     def test_core_fixtures_use_the_same_volume_canonical_runner_temp(self):
         full = (ROOT / ".github/workflows/full-qualification.yml").read_text()
-        self.assertIn('      TEMP: ${{ runner.temp }}', full)
-        self.assertIn('      TMP: ${{ runner.temp }}', full)
+        self.assertIn('          TEMP: ${{ runner.temp }}', full)
+        self.assertIn('          TMP: ${{ runner.temp }}', full)
+        self.assertNotIn('\n      TEMP: ${{ runner.temp }}', full)
+
+    def test_x4_historical_comments_do_not_demote_a_live_platform(self):
+        matrix = ('      # Previously experimental: true, later experimental: false\n'
+                  '        - os: windows-latest\n          experimental: false\n'
+                  '        - os: ubuntu-latest\n          experimental: false\n')
+        contracts.x4_matrix(matrix)
+        with self.assertRaises(contracts.ContractError):
+            contracts.x4_matrix(matrix.replace('          experimental: false', '          experimental: true', 1))
 
     def test_job_comments_are_not_jobs_but_unknown_job_layout_refuses(self):
         text = "name: CI\njobs:\n  # A documented boundary\n  fast:\n    runs-on: ubuntu-latest\n"

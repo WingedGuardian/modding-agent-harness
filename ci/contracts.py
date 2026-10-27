@@ -8,7 +8,7 @@ import re
 
 FAST = {"core": {"fast"}, "skyrim": {"shell", "python", "node", "toolkit", "setup-smoke"}, "x4": {"quick", "scrub"}}
 FULL = {"core": {"stdlib"}, "skyrim": {"behavior", "dotnet", "resaver-plus", "release-build"}, "x4": {"tests"}}
-REQUIRED_IF = "${{ always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}"
+REQUIRED_IF = "${{ always() }}"
 FULL_IF = "${{ needs.policy.outputs.full_required == 'true' }}"
 
 
@@ -72,6 +72,13 @@ def verify_action(block, expected):
     require("needs-json: ${{ toJSON(needs) }}" in block, "gate must verify actual dependency results")
 
 
+def x4_matrix(matrix):
+    platforms = re.findall(r"^\s+- os:\s*(\S+)", matrix, re.M)
+    require(len(platforms) == 2 and set(platforms) == {"windows-latest", "ubuntu-latest"}, "X4 OS matrix changed")
+    flags = re.findall(r"^\s+experimental:\s*(\S+)", matrix, re.M)
+    require(flags == ["false", "false"], "X4 platform gate demoted")
+
+
 def check_contract(root, profile):
     require(profile in FAST, "unknown workflow profile")
     root = Path(root)
@@ -128,6 +135,5 @@ def check_contract(root, profile):
     if profile == "skyrim":
         require(list_field(matrix, "part") == {"suite", "mutations"}, "suite or mutation matrix removed")
     if profile == "x4":
-        require("os: windows-latest" in matrix and "os: ubuntu-latest" in matrix, "X4 OS matrix changed")
-        require("experimental: true" not in matrix and matrix.count("experimental: false") == 2, "X4 platform gate demoted")
+        x4_matrix(matrix)
     return dict(profile=profile, fast_jobs=sorted(FAST[profile]), full_jobs=sorted(FULL[profile]))

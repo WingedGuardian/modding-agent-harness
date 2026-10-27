@@ -1,7 +1,8 @@
 # Contributing
 
 Use a draft pull request while developing. Drafts run syntax and CI-policy checks;
-they do not claim full qualification. Mark the PR ready to run every conformance
+they do not claim full qualification. The merge check deliberately remains blocked
+on a draft, even when its fast checks are green. Mark the PR ready to run every conformance
 leg. A later code update requires fresh full qualification before merge.
 
 Full qualification waits for fast checks and uses a native repository-wide queue.

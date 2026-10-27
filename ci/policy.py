@@ -175,6 +175,8 @@ def main(argv=None):
             summary("**CI policy:** " + record["qualification"] + "\n\nHead: `" + record["head_sha"] +
                     "`; tested candidate: `" + record["candidate_sha"] + "`.")
         elif args.mode == "verify":
+            if not record["full_required"]:
+                raise PolicyError("draft PR: full qualification is deferred; merge remains blocked")
             record["jobs"] = verify(read_json(os.environ.get("CI_REQUIRED_JOBS", "null")),
                                     read_json(os.environ.get("CI_NEEDS_JSON", "null")))
             record["qualification"] = "successful-required-jobs"
