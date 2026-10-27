@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modding-agent-harness"
+version = "0.1.0"
+description = "Offline, agent-neutral harness primitives for game modding toolkits"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[tool.setuptools]
+packages = ["modding_harness"]
+
+[tool.setuptools.package-data]
+modding_harness = ["*.mjs"]
