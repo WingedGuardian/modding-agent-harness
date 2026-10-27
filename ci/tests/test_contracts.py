@@ -14,6 +14,16 @@ class ContractTests(unittest.TestCase):
     def test_current_core_workflow_has_every_required_boundary(self):
         self.assertEqual(contracts.check_contract(ROOT, "core")["full_jobs"], ["stdlib"])
 
+    def test_shared_verifier_accepts_a_pinned_component_with_version_comment(self):
+        block = '\n      - uses: WingedGuardian/modding-agent-harness/.github/actions/ci-policy@' + 'a'*40 + ' # v1 policy API\n'
+        block += '        with:\n          mode: verify\n          required-jobs: \'["fast"]\'\n          needs-json: ${{ toJSON(needs) }}\n'
+        contracts.verify_action(block, {"fast"})
+
+    def test_core_fixtures_use_the_same_volume_canonical_runner_temp(self):
+        full = (ROOT / ".github/workflows/full-qualification.yml").read_text()
+        self.assertIn('      TEMP: ${{ runner.temp }}', full)
+        self.assertIn('      TMP: ${{ runner.temp }}', full)
+
     def test_job_comments_are_not_jobs_but_unknown_job_layout_refuses(self):
         text = "name: CI\njobs:\n  # A documented boundary\n  fast:\n    runs-on: ubuntu-latest\n"
         self.assertEqual(set(contracts.jobs(text)), {"fast"})

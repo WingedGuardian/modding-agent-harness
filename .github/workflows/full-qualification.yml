@@ -10,6 +10,11 @@ jobs:
     name: Core conformance (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    # Fixtures need canonical temp paths on the checkout's volume. GitHub's
+    # Windows default is an 8.3 alias on C:, while its checkout is on D:.
+    env:
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
     strategy:
       fail-fast: false
       max-parallel: 4

@@ -62,7 +62,7 @@ def verify_action(block, expected):
     steps = re.split(r"(?=^      - )", block, flags=re.M)
     verifiers = [step for step in steps if re.search(r"^\s+mode: verify\s*$", step, re.M)]
     require(len(verifiers) == 1, "required gate must have one verifier")
-    require(re.search(r"^      - uses: (?:\./\.github/actions/ci-policy|WingedGuardian/modding-agent-harness/\.github/actions/ci-policy@[0-9a-f]{40})\s*$", verifiers[0], re.M) is not None,
+    require(re.search(r"^      - uses: (?:\./\.github/actions/ci-policy|WingedGuardian/modding-agent-harness/\.github/actions/ci-policy@[0-9a-f]{40})[^\S\n]*(?:#.*)?$", verifiers[0], re.M) is not None,
             "required gate must execute the shared verifier")
     block = verifiers[0]
     match = re.findall(r"^\s+required-jobs:\s*'\[([^\]]*)\]'\s*$", block, re.M)
