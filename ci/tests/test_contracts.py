@@ -14,6 +14,12 @@ class ContractTests(unittest.TestCase):
     def test_current_core_workflow_has_every_required_boundary(self):
         self.assertEqual(contracts.check_contract(ROOT, "core")["full_jobs"], ["stdlib"])
 
+    def test_job_comments_are_not_jobs_but_unknown_job_layout_refuses(self):
+        text = "name: CI\njobs:\n  # A documented boundary\n  fast:\n    runs-on: ubuntu-latest\n"
+        self.assertEqual(set(contracts.jobs(text)), {"fast"})
+        with self.assertRaises(contracts.ContractError):
+            contracts.jobs("name: CI\njobs:\n  - hidden-job\n")
+
     def test_each_planted_weakened_contract_refuses(self):
         main = (ROOT / ".github/workflows/ci.yml").read_text()
         full = (ROOT / ".github/workflows/full-qualification.yml").read_text()

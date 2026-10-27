@@ -24,7 +24,7 @@ def require(condition, message):
 def jobs(text):
     require(text.count("\njobs:\n") == 1, "expected one plain jobs mapping")
     body = text.split("\njobs:\n", 1)[1]
-    headers = list(re.finditer(r"^  (\S.*)$", body, re.M))
+    headers = list(re.finditer(r"^  (?!#)(\S.*)$", body, re.M))
     require(bool(headers), "empty workflow jobs")
     result = {}
     for index, header in enumerate(headers):
