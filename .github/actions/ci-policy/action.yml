@@ -1,0 +1,42 @@
+name: Shared CI policy
+description: Classify draft versus full qualification, verify dependencies, and record source-bound timings.
+inputs:
+  profile:
+    description: Repository profile (core, skyrim, x4).
+    required: true
+  mode:
+    description: context, verify, report, or contract.
+    default: context
+  required-jobs:
+    description: JSON array of required direct dependency job IDs for verify mode.
+    default: '[]'
+  needs-json:
+    description: GitHub toJSON(needs) for verify mode.
+    default: '{}'
+outputs:
+  full_required:
+    description: True for ready PRs, pushes, and manual dispatch; false for drafts.
+    value: ${{ steps.policy.outputs.full_required }}
+  head_sha:
+    description: Source branch commit.
+    value: ${{ steps.policy.outputs.head_sha }}
+  candidate_sha:
+    description: Commit actually tested, including the PR merge candidate.
+    value: ${{ steps.policy.outputs.candidate_sha }}
+  base_sha:
+    description: PR base commit, or empty for non-PR events.
+    value: ${{ steps.policy.outputs.base_sha }}
+runs:
+  using: composite
+  steps:
+    - name: Apply shared CI policy
+      id: policy
+      shell: bash
+      env:
+        CI_PROFILE: ${{ inputs.profile }}
+        CI_MODE: ${{ inputs.mode }}
+        CI_REQUIRED_JOBS: ${{ inputs.required-jobs }}
+        CI_NEEDS_JSON: ${{ inputs.needs-json }}
+        CI_POLICY_REF: ${{ github.action_ref }}
+        CI_GITHUB_TOKEN: ${{ github.token }}
+      run: python -B "$GITHUB_ACTION_PATH/../../../ci/policy.py" "$CI_MODE" --profile "$CI_PROFILE"

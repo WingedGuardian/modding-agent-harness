@@ -1,24 +1,91 @@
-name: Core conformance
+name: CI
 on:
   push:
+    branches: [master, main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
+
 jobs:
-  stdlib:
-    runs-on: ${{ matrix.os }}
+  policy:
+    name: CI policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      full_required: ${{ steps.context.outputs.full_required }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-policy
+        id: context
+        with:
+          profile: core
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-context
+          path: ${{ runner.temp }}/ci-context.json
+          if-no-files-found: error
+
+  fast:
+    name: Fast checks
+    needs: [policy]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ['3.10', '3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python }}
-      - run: python -B -m unittest discover -s tests -v
+          python-version: '3.13'
+      - name: Python syntax
+        run: |
+          python -B -c "import ast, pathlib, subprocess; names=subprocess.check_output(['git','ls-files','-z']).decode().split(chr(0)); [ast.parse(pathlib.Path(p).read_bytes(), filename=p) for p in names if p.endswith('.py')]; print('Tracked Python syntax valid')"
+      - name: Shared policy and workflow contracts
+        run: python -B -m unittest discover -s ci/tests -v
+      - uses: ./.github/actions/ci-policy
+        with:
+          profile: core
+          mode: contract
+
+  qualification:
+    name: Full qualification
+    needs: [policy, fast]
+    if: ${{ needs.policy.outputs.full_required == 'true' }}
+    concurrency:
+      group: full-qualification-${{ github.repository }}
+      queue: max
+      cancel-in-progress: false
+    uses: ./.github/workflows/full-qualification.yml
+
+  required:
+    name: CI required
+    needs: [policy, fast, qualification]
+    if: ${{ always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-policy
+        with:
+          profile: core
+          mode: verify
+          required-jobs: '["policy","fast","qualification"]'
+          needs-json: ${{ toJSON(needs) }}
+      - uses: ./.github/actions/ci-policy
+        if: always()
+        with:
+          profile: core
+          mode: report
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: ci-qualification-evidence
+          path: ${{ runner.temp }}/ci-*.json
+          if-no-files-found: error
