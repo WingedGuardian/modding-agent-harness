@@ -12,7 +12,8 @@ jobs:
     timeout-minutes: 10
     strategy:
       fail-fast: false
-      max-parallel: 4
+      # every leg at once (8 = the whole matrix): the run is as long as its slowest job, not its queue
+      max-parallel: 8
       matrix:
         os: [ubuntu-latest, windows-latest]
         python: ['3.10', '3.11', '3.12', '3.13']

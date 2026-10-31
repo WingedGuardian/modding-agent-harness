@@ -7,7 +7,12 @@ from pathlib import Path
 import re
 
 FAST = {"core": {"fast"}, "skyrim": {"shell", "python", "node", "toolkit", "setup-smoke"}, "x4": {"quick", "scrub"}}
-FULL = {"core": {"stdlib"}, "skyrim": {"behavior", "dotnet", "resaver-plus", "release-build"}, "x4": {"tests"}}
+FULL = {"core": {"stdlib"}, "skyrim": {"behavior", "mutations-total", "dotnet", "resaver-plus", "release-build"},
+        "x4": {"tests"}}
+# The heavy matrix must be capped, and the cap must let every leg run at once: a run is as long as its slowest job,
+# not its queue (owner ruling 2026-10-31, after a month of 4-5 h Skyrim rounds whose Linux legs waited 95 minutes
+# behind a cap of 4). 20 is the account's hosted-runner concurrency; a cap above it is a number that means nothing.
+MAX_PARALLEL = 20
 REQUIRED_IF = "${{ always() }}"
 FULL_IF = "${{ needs.policy.outputs.full_required == 'true' }}"
 
@@ -72,6 +77,30 @@ def verify_action(block, expected):
     require("needs-json: ${{ toJSON(needs) }}" in block, "gate must verify actual dependency results")
 
 
+def skyrim_shards(matrix, totals):
+    """The Skyrim mutation gate runs as shards: `include` rows `{os, python, part: mutations, shard: i, shards: n}` on
+    the oldest tested Python, one complete 1..n set per OS, and the mutations-total job's matrix names the same n per
+    OS so the shards' logs are summed as one gate. A missing shard is a slice of the gate nobody ran."""
+    rows = re.findall(r"^\s+- \{os: (\S+), python: \"?([\d.]+)\"?, part: mutations, shard: (\d+), shards: (\d+)\}\s*$",
+                      matrix, re.M)
+    require(bool(rows), "mutation shards missing from the Skyrim matrix")
+    per_os = {}
+    for os_name, python, shard, shards in rows:
+        require(python == "3.10", "mutation shards must run on the oldest tested Python")
+        per_os.setdefault(os_name, set()).add((int(shard), int(shards)))
+    require(set(per_os) == {"ubuntu-latest", "windows-latest"}, "mutation shards must cover both OSes")
+    counts = {}
+    for os_name, got in per_os.items():
+        n = {shards for _, shards in got}
+        require(len(n) == 1, "mutation shard counts disagree for " + os_name)
+        n = n.pop()
+        require(got == {(i, n) for i in range(1, n + 1)}, "mutation shards incomplete for " + os_name)
+        counts[os_name] = n
+    summed = re.findall(r"^\s+- \{os: (\S+), leg: (Windows|Linux), shards: (\d+)\}\s*$", totals, re.M)
+    require({(o, int(n)) for o, _, n in summed} == set(counts.items()), "mutations-total does not sum every shard")
+    require("--part mutations" in totals, "mutations-total must check the mutation part's numbers")
+
+
 def x4_matrix(matrix):
     platforms = re.findall(r"^\s+- os:\s*(\S+)", matrix, re.M)
     require(len(platforms) == 2 and set(platforms) == {"windows-latest", "ubuntu-latest"}, "X4 OS matrix changed")
@@ -128,12 +157,13 @@ def check_contract(root, profile):
         require(profile == "core" or all(value.startswith("WingedGuardian/modding-agent-harness/") for value in policy_actions), "consumer policy must come from core")
     matrix = inner["stdlib" if profile == "core" else "behavior" if profile == "skyrim" else "tests"]
     parallel = re.findall(r"^\s+max-parallel:\s*(\d+)\s*$", matrix, re.M)
-    require(len(parallel) == 1 and 1 <= int(parallel[0]) <= 4, "heavy matrix is not capped")
+    require(len(parallel) == 1 and 1 <= int(parallel[0]) <= MAX_PARALLEL, "heavy matrix is not capped")
     if profile in ("core", "skyrim"):
         require(list_field(matrix, "os") == {"ubuntu-latest", "windows-latest"}, "OS matrix changed")
         require(list_field(matrix, "python") == {"3.10", "3.11", "3.12", "3.13"}, "Python matrix changed")
     if profile == "skyrim":
-        require(list_field(matrix, "part") == {"suite", "mutations"}, "suite or mutation matrix removed")
+        require(list_field(matrix, "part") == {"suite"}, "suite matrix removed")
+        skyrim_shards(matrix, inner["mutations-total"])
     if profile == "x4":
         x4_matrix(matrix)
     return dict(profile=profile, fast_jobs=sorted(FAST[profile]), full_jobs=sorted(FULL[profile]))
