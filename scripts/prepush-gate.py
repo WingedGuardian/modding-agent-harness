@@ -9,7 +9,8 @@ changes, under a minute:
   1. every tracked Python file parses (the fast job's syntax step);
   2. the shared policy and workflow contract tests (ci/tests), and this repository's own workflows pass the contract;
   3. the conformance tests for the files the push changes (`git diff --name-only BASE...HEAD`): a changed test runs
-     itself; a changed module under modding_harness/ runs every tests/test_*<its stem>*.py.
+     itself; a changed module under modding_harness/ runs every tests/test_*<its stem>*.py; and every test file whose
+     text names a changed file's basename runs, since that is the test that goes red on it.
 
 BASE defaults to the branch's upstream, else the merge-base with origin/master. Exit 0 = passed, 1 = a step failed,
 2 = could not run.
@@ -45,6 +46,27 @@ def base_rev(explicit):
     return ""
 
 
+def referencing_tests(changed):
+    """Every tests/test_*.py whose TEXT names a changed file's basename.
+
+    Stem matching alone missed the Skyrim toolkit's CI run 41254615914 (3 deterministic reds on all 8 legs): the
+    push changed workflow and build files, and the tests asserting on them by name shared no stem with them. A test
+    that spells the changed file is the one that goes red on it, so select by reference as well.
+    """
+    names = {Path(p).name for p in changed if not (p.startswith("tests/test_") and p.endswith(".py"))}
+    if not names:
+        return []
+    out = []
+    for f in sorted((REPO / "tests").glob("test_*.py")):
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(n in text for n in names):
+            out.append(f.relative_to(REPO).as_posix())
+    return out
+
+
 def tests_for(changed):
     want = []
     for p in changed:
@@ -53,6 +75,7 @@ def tests_for(changed):
         elif p.startswith("modding_harness/") and p.endswith(".py"):
             stem = Path(p).stem
             want.extend(Path(f).relative_to(REPO).as_posix() for f in glob.glob(str(REPO / "tests" / ("test_*" + stem + "*.py"))))
+    want.extend(referencing_tests(changed))
     return [t for i, t in enumerate(want) if t not in want[:i] and (REPO / t).is_file()]
 
 
