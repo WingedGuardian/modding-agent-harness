@@ -97,6 +97,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--base", default="")
     a = ap.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")   # a cp1252 console must not crash the gate on a test's output
+        except Exception:                           # (UnicodeEncodeError printing a failing step, X4, 2026-11-01)
+            pass
     base = base_rev(a.base)
     changed = [l.replace("\\", "/") for l in _git("diff", "--name-only", base + "...HEAD").splitlines() if l.strip()] if base else []
     print("prepush-gate: {} @ {}  base {}  {} changed file(s)".format(
