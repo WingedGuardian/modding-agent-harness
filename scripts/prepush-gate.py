@@ -54,6 +54,10 @@ def referencing_tests(changed):
     that spells the changed file is the one that goes red on it, so select by reference as well.
     """
     names = {Path(p).name for p in changed if not (p.startswith("tests/test_") and p.endswith(".py"))}
+    # A test can reach a workflow through its folder, naming no file: X4 CI run 41399417477 went red on all four legs
+    # on a test that globs .github/workflows, and name matching had skipped it.
+    if any(p.startswith(".github/workflows/") for p in changed):
+        names.add(".github/workflows")
     if not names:
         return []
     out = []
