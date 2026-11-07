@@ -173,3 +173,7 @@ review and rollback-plan staging cannot become authoritative. Save preservation
 also retains its separate final manifest/blob verification.
 
 Core fixtures do not certify host enforcement or native game round-trips.
+
+## Development CI
+
+Start with a draft pull request for fast checks. Mark it ready for complete qualification; see [Contributing](CONTRIBUTING.md).

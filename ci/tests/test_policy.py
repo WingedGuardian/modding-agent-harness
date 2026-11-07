@@ -158,6 +158,21 @@ class CliTests(unittest.TestCase):
             self.assertEqual(row["timing_unavailable"], "OSError")
             self.assertNotEqual(row["qualification"], "successful-required-jobs")
 
+    def test_report_does_not_persist_authentication_or_raw_event_body(self):
+        with tempfile.TemporaryDirectory() as owned:
+            folder = Path(owned)
+            env = self.env(folder)
+            env["CI_GITHUB_TOKEN"] = "fixture-auth-must-stay-private"
+            raw_event = event()
+            raw_event["pull_request"]["body"] = "fixture-PR-body-must-stay-private"
+            (folder/"event.json").write_text(json.dumps(raw_event), encoding="utf-8")
+            with patch.dict(os.environ, env, clear=True), patch.object(policy, "collect_timings", return_value=[]) as collect:
+                self.assertEqual(policy.main(["report", "--profile", "core"]), 0)
+                self.assertEqual(collect.call_args.args[2], env["CI_GITHUB_TOKEN"])
+            persisted = (folder/"ci-report.json").read_text() + (folder/"summary").read_text()
+            self.assertNotIn(env["CI_GITHUB_TOKEN"], persisted)
+            self.assertNotIn(raw_event["pull_request"]["body"], persisted)
+
 
 if __name__ == "__main__":
     unittest.main()
