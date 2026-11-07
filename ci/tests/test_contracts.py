@@ -39,6 +39,33 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(contracts.ContractError):
             contracts.jobs("name: CI\njobs:\n  - hidden-job\n")
 
+    SKYRIM_SHARDS = ('      matrix:\n        os: [windows-latest, ubuntu-latest]\n        part: [suite]\n        include:\n'
+                     '          - {os: windows-latest, python: "3.10", part: mutations, shard: 1, shards: 2}\n'
+                     '          - {os: windows-latest, python: "3.10", part: mutations, shard: 2, shards: 2}\n'
+                     '          - {os: ubuntu-latest, python: "3.10", part: mutations, shard: 1, shards: 1}\n')
+    SKYRIM_TOTALS = ('      matrix:\n        include:\n          - {os: windows-latest, leg: Windows, shards: 2}\n'
+                     '          - {os: ubuntu-latest, leg: Linux, shards: 1}\n'
+                     '        run: python scripts/check_ci_leg.py log "${logs[@]}" --leg "$LEG" --part mutations\n')
+
+    def test_skyrim_mutation_shards_must_be_complete_and_summed(self):
+        contracts.skyrim_shards(self.SKYRIM_SHARDS, self.SKYRIM_TOTALS)
+        bad = [(self.SKYRIM_SHARDS.replace("shard: 2, shards: 2}\n", ""), self.SKYRIM_TOTALS),       # a slice nobody runs
+               (self.SKYRIM_SHARDS.replace("shard: 2, shards: 2}", "shard: 2, shards: 3}"), self.SKYRIM_TOTALS),
+               (self.SKYRIM_SHARDS.replace('python: "3.10", part: mutations, shard: 1, shards: 1',
+                                           'python: "3.13", part: mutations, shard: 1, shards: 1'), self.SKYRIM_TOTALS),
+               (self.SKYRIM_SHARDS.replace("          - {os: ubuntu-latest, python: \"3.10\", part: mutations, shard: 1, shards: 1}\n", ""),
+                self.SKYRIM_TOTALS),                                                                   # one OS only
+               (self.SKYRIM_SHARDS, self.SKYRIM_TOTALS.replace("leg: Windows, shards: 2", "leg: Windows, shards: 1")),
+               (self.SKYRIM_SHARDS, self.SKYRIM_TOTALS.replace("--part mutations", "")),
+               (self.SKYRIM_SHARDS.replace("part: mutations", "part: mutation"), self.SKYRIM_TOTALS)]
+        for matrix, totals in bad:
+            with self.subTest(matrix=matrix[-120:], totals=totals[-80:]), self.assertRaises(contracts.ContractError):
+                contracts.skyrim_shards(matrix, totals)
+
+    def test_the_parallel_cap_is_the_account_concurrency(self):
+        self.assertEqual(contracts.MAX_PARALLEL, 20)
+        self.assertIn("mutations-total", contracts.FULL["skyrim"])
+
     def test_each_planted_weakened_contract_refuses(self):
         main = (ROOT / ".github/workflows/ci.yml").read_text()
         full = (ROOT / ".github/workflows/full-qualification.yml").read_text()
@@ -51,7 +78,8 @@ class ContractTests(unittest.TestCase):
                  ("main", "      - uses: ./.github/actions/ci-policy\n        with:\n          profile: core\n          mode: verify", "      - uses: other/action@" + "a"*40 + "\n        with:\n          profile: core\n          mode: verify"),
                  ("main", "needs-json: ${{ toJSON(needs) }}", "needs-json: '{}'"),
                  ("main", "timeout-minutes: 10", "timeout-minutes: 0"),
-                 ("full", "max-parallel: 4", "max-parallel: 16"),
+                 ("full", "max-parallel: 8", "max-parallel: 21"),
+                 ("full", "max-parallel: 8", "max-parallel: 0"),
                  ("full", "'3.10', '3.11', '3.12', '3.13'", "'3.13'"),
                  ("full", "ubuntu-latest, windows-latest", "ubuntu-latest"),
                  ("full", "    timeout-minutes: 10", "    timeout-minutes: 999"),

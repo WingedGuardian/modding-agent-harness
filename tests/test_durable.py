@@ -60,6 +60,34 @@ class MetadataDurabilityTests(unittest.TestCase):
     def test_corrupt_closed_metadata_is_refused_before_publication(self):
         self.qualify("corrupt_before_publication")
 
+    def test_a_bundle_can_be_staged_through_a_linked_parent(self):
+        """A symlink, junction, 8.3 short name or mapped drive above the bundle spells the same place differently."""
+        import hashlib
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder).resolve()
+            root, source, real = base / "installed", base / "source", base / "real"
+            root.mkdir()
+            source.mkdir()
+            real.mkdir()
+            (root / "runtime.py").write_bytes(b"old runtime")
+            (source / "runtime.py").write_bytes(b"new runtime")
+            for tree in (root, source):                  # rollback/.claude/settings.json is what the check walks
+                (tree / ".claude").mkdir()
+                (tree / ".claude/settings.json").write_text("{}")
+            link = base / "link"
+            if os.name == "nt":
+                import _winapi
+                _winapi.CreateJunction(str(real), str(link))
+            else:
+                os.symlink(real, link)
+            settings = hashlib.sha256(b"{}").hexdigest()
+            inventory = lambda raw: {"v": 1, "files": {"runtime.py": hashlib.sha256(raw).hexdigest(), ".claude/settings.json": settings}}
+            try:
+                upgrade.stage_review_bundle(root, source, link / "review", inventory(b"new runtime"), inventory(b"old runtime"), reserve=0)
+                self.assertTrue((real / "review" / "complete.json").exists())
+            finally:
+                os.rmdir(link) if os.name == "nt" else link.unlink()
+
     def test_upgrade_cannot_publish_runtime_with_a_corrupted_rollback_plan(self):
         import hashlib
         with tempfile.TemporaryDirectory() as folder:

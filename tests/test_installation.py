@@ -302,6 +302,8 @@ class InstallationTests(unittest.TestCase):
             args = parser.parse_args(['upgrade-rollback', result['operation'], '--installed-root', str(root), '--quiescent'])
             installation.handle(args, source)
             self.assertEqual((root / 'owned.txt').read_bytes(), b'old')
+            self.assertEqual(installation.failure('upgrade-preview', ValueError('bad candidate'), 'adapter failed')[1], 2,
+                             'a failed preview must not look like a success to `preview && stage`')
             failed, status = installation.failure('upgrade-apply', installation.UpgradeFailed('published=[owned]; journal=private'), 'profile')
             self.assertEqual(status, 1)
             self.assertIn('published=[owned]; journal=private', failed['result']['reason'])

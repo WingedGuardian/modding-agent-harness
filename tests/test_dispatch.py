@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +28,16 @@ class DispatchTests(unittest.TestCase):
         mutations = tuple(Mutation(str(p), "write") for p in self.files[:count])
         return Dispatcher(self.root, profiles.toy([self.saves]),
                           lambda action: Evaluation(Result(evaluation="evaluated"), SavePlan(mutations, **options)))
+
+    def test_a_wildcard_matching_no_save_is_denied_and_says_why(self):
+        """Still denied: a wildcard needs a typed approval. But there is nothing to approve, so it must not ask for one."""
+        dispatcher = Dispatcher(self.root, profiles.toy([self.saves]), lambda action: Evaluation(
+            Result(evaluation="evaluated"), SavePlan((), wildcard=True, recheck=lambda: ())))
+        outcome = dispatcher.pre(self.action)
+        self.assertEqual(outcome.result.decision, "deny")
+        self.assertFalse(outcome.transactions)
+        self.assertIn("matches no existing save", outcome.result.reason)
+        self.assertNotIn("typed canonical human approval required", outcome.result.reason)
 
     def test_one_save_requires_verified_preservation_and_preview_is_distinct(self):
         dispatcher = self.dispatcher()
@@ -118,6 +129,32 @@ class DispatchTests(unittest.TestCase):
                 outcome = self.asking(0, local=local).pre(action)
                 self.assertEqual(outcome.result.decision, "deny")
                 self.assertIn("permanent save store is protected", outcome.result.reason)
+
+    def test_moving_or_deleting_a_folder_above_the_store_is_denied(self):
+        holder = self.root / ".modding-agent-harness"
+        for operation, denied in (("delete", True), ("move", True), ("write", False)):
+            with self.subTest(operation=operation):
+                action = Action("claude", "toy-edit", "native", session_id="session", command="edit",
+                                paths=(str(holder),), operations=(operation,))
+                reason = self.asking(0).pre(action).result.reason or ""
+                self.assertEqual("permanent save store is protected" in reason, denied)
+
+    def test_store_check_resolves_the_store_once_however_many_paths(self):
+        from unittest.mock import patch
+        from modding_harness import preservation
+        real, calls = preservation.canonical, []
+        def counted(path):
+            calls.append(os.fspath(path))
+            return real(path)
+        def store_lookups(count):
+            calls.clear()
+            paths = tuple(str(self.root / "dev" / "f{}.txt".format(i)) for i in range(count))
+            action = Action("claude", "toy-edit", "native", session_id="session", command="edit",
+                            paths=paths, operations=("write",) * count)
+            with patch.object(preservation, "canonical", counted):
+                self.asking(0).pre(action)
+            return len(calls) - count
+        self.assertEqual(store_lookups(1), store_lookups(12))
 
     def test_ask_preview_preserves_nothing(self):
         outcome = self.asking().pre(self.action, preserve=False)

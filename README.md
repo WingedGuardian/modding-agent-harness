@@ -4,6 +4,12 @@ An offline Python 3.10–3.13 library shared by independently released game tool
 Game profiles own save membership, protected roots, rules and validators. Host
 adapters own payload interpretation and transport. Neither belongs in preservation.
 
+## Game launch consent
+
+Agents must ask for fresh, launch-specific human approval immediately before each game run or restart, including headless and background tests. Reconfirm if preparation delays the launch. General testing approval, resource exemptions, prior sessions and generic continuation do not grant launch consent. State the game, mode, desktop and test profile/save; wait for the answer. See [AGENTS.md](AGENTS.md#game-launch-approval).
+
+This is a host/agent behavior requirement. The current preservation API does not enforce game-process launch consent.
+
 The v1 contracts distinguish policy, evaluation, preservation and validation.
 Unknown tools warn and allow, with unguarded coverage. A profile that declares save
 obligations must complete evaluation; an unguarded result refuses that work. Local
@@ -34,6 +40,10 @@ Entirely absent groups are rechecked independently of the pre-restore backup.
 Every previously absent destination uses no-clobber publication; a counterpart
 appearing during publication produces an accurately journalled partial failure.
 
+Contributor resource limits are in [AGENTS.md](AGENTS.md): physical RAM is primary,
+with a small fixed commit buffer. They govern agent development work, not the
+library's callers, and are not propagated by runtime vendoring.
+
 Run fixtures without installation or network:
 
     python -B -m unittest discover -s tests -v
@@ -47,6 +57,32 @@ JSON object on stdin and applies the toy third-game file policy. `--preview`
 never preserves bytes or records an execution receipt. Game toolkits provide
 their own policy callback to `generic.handle`; the toy policy is an example,
 not a replacement for game rules. `examples/adapter.py` describes the host side.
+
+`python -B -m modding_harness.charter [session-start|prompt] --workspace PATH` keeps a session's origin and its
+ledger across context compaction for Claude Code and Codex, in `.agent-sessions/` (outside the guarded
+`.modding-agent-harness/`; toolkits gitignore it). Register `prompt` on UserPromptSubmit: a session's first prompt
+becomes `<session id>.md`, its origin (2 KiB cap, exclusive create), and every prompt then carries a one-line ledger
+inventory plus the open rows (1.5 KiB; nothing at all while the ledger is empty). Register `session-start` on
+SessionStart: both hosts run it with source `compact` after compaction, and it prints the origin and the whole open
+ledger with the exact commands. The ledger (`modding_harness/ledger.py add|update|mission|list`, runnable as a plain
+file) is an append-only `<session id>.ledger.jsonl`: one sentence per agreed item, an id, a status
+(open/in_progress/done/absorbed/dropped) and evidence, which closing a row requires; a torn line is skipped and
+counted. Give the hooks their own entries; on Codex set `additionalContextLimit` to about 4000. Only regular files
+whose real path is inside the workspace are read or written. OpenCode is not covered yet.
+
+`python -B modding_harness/find_session.py "<what was discussed>"` finds the past Claude Code or Codex session
+where something was discussed, down to the passage. The search is obra/episodic-memory (MIT, local embeddings),
+installed separately; this is the glue around it. It resolves the index directory itself (`EPISODIC_MEMORY_CONFIG_DIR`,
+else `~/.local/share/episodic-memory-data`, else the tool's default), because the tool otherwise searches an empty
+default index without saying so. It runs the incremental sync first, with summaries off, waits up to 240 s for it, and then searches
+what is indexed. It never kills a slower sync, and starts it in its own process group, because a killed sync holds
+its lock for ten minutes. A Windows SSH session still ends it with the session. A sync that is still running, skipped
+or failed is reported on the first line as possibly stale. Then it runs a semantic search with subagent threads
+excluded, shows an injected turn (instruction blocks, environment headers, task notifications) by the reply that followed it,
+and groups the hits by session. Each session gets one block: date range, harness, project, first typed prompt, best passages with
+transcript line ranges, and its resume command with the directory to run it from. When several sessions match, the output tells the agent to ask the
+user for a separating detail rather than pick one. Use `--json` for data and `--no-sync` to skip the update. Exit codes
+are 0 (found), 1 (none) and 2 (could not run, with the reason on stderr).
 
 `coverage --session-id ID` reports receipt correlation and every unknown tool
 occurrence. Commands, arguments, paths and environment are excluded; session
@@ -135,6 +171,8 @@ New metadata uses complete descriptor writes, fsync and independent size/hash
 readback before no-clobber publication. Incomplete or corrupted transaction,
 review and rollback-plan staging cannot become authoritative. Save preservation
 also retains its separate final manifest/blob verification.
+
+Core fixtures do not certify host enforcement or native game round-trips.
 
 ## Development CI
 
