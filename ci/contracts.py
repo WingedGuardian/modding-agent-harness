@@ -8,7 +8,10 @@ import re
 
 FAST = {"core": {"fast"}, "skyrim": {"shell", "python", "node", "toolkit", "setup-smoke"}, "x4": {"quick", "scrub"}}
 FULL = {"core": {"stdlib"}, "skyrim": {"behavior", "mutations-total", "dotnet", "resaver-plus", "release-build"},
-        "x4": {"tests"}}
+        "x4": {"tests", "cold-clone", "cold-archive", "installed-copy", "hook-mutation"}}
+# X4 4.1 split four checks out of `tests` into their own full jobs: the two cold verifications, the suite on an
+# installed copy, and the hook mutation gate (sharded, because inside `tests` it outran the 360-minute job limit).
+# Each is required: the full gate must depend on all five, so dropping one is an inventory change, not a quiet skip.
 # The heavy matrix must be capped, and the cap must let every leg run at once: a run is as long as its slowest job,
 # not its queue (owner ruling 2026-10-31, after a month of 4-5 h Skyrim rounds whose Linux legs waited 95 minutes
 # behind a cap of 4). 20 is the account's hosted-runner concurrency; a cap above it is a number that means nothing.
