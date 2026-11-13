@@ -24,6 +24,24 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
+      # Real-host OpenCode qualification (tests/test_opencode_host.py): one pinned OpenCode on the newest Python leg of
+      # each OS. The test fails, rather than skips, when this host is missing.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: ${{ matrix.python == '3.13' }}
+        with:
+          node-version: '24.19.0'
+      - name: OpenCode host 1.19.5
+        if: ${{ matrix.python == '3.13' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/opencode" --no-audit --no-fund opencode-ai@1.19.5
+          bin="$(find "$RUNNER_TEMP/opencode/node_modules" -type f | grep -E 'opencode-(linux|windows)-x64/bin/opencode(\.exe)?$' | head -1)"
+          test -n "$bin"
+          if command -v cygpath >/dev/null; then bin="$(cygpath -w "$bin")"; fi
+          "$bin" --version
+          echo "MODDING_HARNESS_OPENCODE_BIN=$bin" >> "$GITHUB_ENV"
+          echo "MODDING_HARNESS_REQUIRE_OPENCODE_HOST=1" >> "$GITHUB_ENV"
       - name: Complete core conformance
         shell: bash
         # Step context owns runner.temp; job-level env cannot use runner context.
