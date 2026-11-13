@@ -66,6 +66,9 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(contracts.MAX_PARALLEL, 20)
         self.assertIn("mutations-total", contracts.FULL["skyrim"])
 
+    def test_x4_full_inventory_names_every_split_out_job(self):
+        self.assertEqual(contracts.FULL["x4"], {"tests", "cold-clone", "cold-archive", "installed-copy", "hook-mutation"})
+
     def test_each_planted_weakened_contract_refuses(self):
         main = (ROOT / ".github/workflows/ci.yml").read_text()
         full = (ROOT / ".github/workflows/full-qualification.yml").read_text()
