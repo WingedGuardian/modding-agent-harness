@@ -25,6 +25,11 @@ workflow. A red run that is a timing assert on a shared runner is a test-versus-
 specification question first, never a re-run: fix the assert to the promise the
 code makes, or quarantine it with a written ticket.
 
+CI gates releases, not local work (owner ruling 2026-11-16): a merge to `master`, a tag
+or a toolkit's new core pin waits for a green full qualification; trying a change locally,
+deploying it to your own install (guard code after an independent review and the local hook
+tests) and continuing work never wait for CI. Push once per batch; fix a red run in the next.
+
 Default-branch pushes and manual dispatch still run full qualification. Feature
 branches use PR events. The required check verifies dependency outcomes and binds
 reports to both the source head and the actual tested PR merge candidate.
