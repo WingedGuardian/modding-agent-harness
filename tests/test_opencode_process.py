@@ -61,8 +61,15 @@ class OpenCodeProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             # Python's own startup is delayed before the version probe completes.
-            # There is no model, OpenCode host, game, or network call here.
-            (root / "sitecustomize.py").write_text("import time; time.sleep(10)\n")
+            # There is no model, OpenCode host, game, or network call here. The plugin starts
+            # Python isolated (-I), which ignores PYTHONPATH, so the delaying sitecustomize sits
+            # in a throwaway venv's site-packages, which -I still imports.
+            venv = root / "venv"
+            subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True, timeout=120)
+            vpy = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            purelib = subprocess.run([str(vpy), "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+                                     capture_output=True, text=True, check=True, timeout=60).stdout.strip()
+            (Path(purelib) / "sitecustomize.py").write_text("import time; time.sleep(10)\n")
             adapter = root / "adapter.py"
             adapter.write_text("print('HARNESS_OK {\"decision\":\"allow\"}')\n")
             module = Path(__file__).resolve().parents[1] / "modding_harness/opencode_plugin.mjs"
@@ -74,9 +81,9 @@ class OpenCodeProcessTests(unittest.TestCase):
                               " console.log('unexpected allow'); } catch(e) { console.log(e.message); }\n")
             start = time.monotonic()
             result = subprocess.run([node, str(driver)], capture_output=True, text=True, timeout=20,
-                                    env=dict(os.environ, MODDING_HARNESS_PYTHON=sys.executable,
+                                    env=dict(os.environ, MODDING_HARNESS_PYTHON=str(vpy),
                                              MODDING_HARNESS_NO_PYTHON_FALLBACK="1",
-                                             MODDING_HARNESS_OPENCODE_TIMEOUT_S="2", PYTHONPATH=str(root)))
+                                             MODDING_HARNESS_OPENCODE_TIMEOUT_S="2"))
             elapsed = time.monotonic() - start
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("GUARD INERT", result.stdout)
