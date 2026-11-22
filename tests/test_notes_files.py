@@ -27,13 +27,15 @@ def write(root, files):
 
 
 class NotesFilesTests(unittest.TestCase):
-    def stage(self, base, installed, candidate, local_files=()):
+    def stage(self, base, installed, candidate, local_files=(), previous=None):
+        """`previous` is what the last release shipped; it defaults to everything installed, and a user's own file is not in it."""
         root, source, bundle = base / "installed", base / "source", base / "review"
         root.mkdir()
         source.mkdir()
         write(root, installed)
         write(source, candidate)
-        upgrade.stage_review_bundle(root, source, bundle, inventory(candidate), inventory(installed),
+        upgrade.stage_review_bundle(root, source, bundle, inventory(candidate),
+                                    inventory(installed if previous is None else previous),
                                     local_files=local_files, reserve=0)
         return root, bundle, hashlib.sha256((bundle / "complete.json").read_bytes()).hexdigest()
 
@@ -70,6 +72,25 @@ class NotesFilesTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "local settings/notes must be retained"):
                 installation.apply(root, bundle, sha, {name: "candidate"}, quiescent=True, reserve=0)
             self.assertEqual((root / name).read_bytes(), b"mine")
+
+    def test_claude_local_md_is_protected_by_default_in_every_toolkit(self):
+        """A user's private per-project rules file: no toolkit ships it, and an upgrade must never replace it."""
+        with tempfile.TemporaryDirectory() as folder:
+            name = "CLAUDE.local.md"
+            root, bundle, sha = self.stage(Path(folder), {name: b"my private rules"}, {name: b"shipped text"})
+            with self.assertRaisesRegex(ValueError, "local settings/notes must be retained"):
+                installation.apply(root, bundle, sha, {name: "candidate"}, quiescent=True, reserve=0)
+            self.assertEqual((root / name).read_bytes(), b"my private rules")
+
+    def test_claude_local_md_edited_while_a_review_is_open_never_blocks_the_upgrade(self):
+        with tempfile.TemporaryDirectory() as folder:
+            name = "CLAUDE.local.md"
+            root, bundle, sha = self.stage(Path(folder), {"owned.txt": b"old", name: b"rules v1"},
+                                           {"owned.txt": b"new"}, previous={"owned.txt": b"old"})
+            (root / name).write_bytes(b"rules v2, typed during the review")
+            installation.apply(root, bundle, sha, quiescent=True, reserve=0)
+            self.assertEqual((root / "owned.txt").read_bytes(), b"new")
+            self.assertEqual((root / name).read_bytes(), b"rules v2, typed during the review")
 
     def test_bad_notes_names_are_refused(self):
         with tempfile.TemporaryDirectory() as folder:
