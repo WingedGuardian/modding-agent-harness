@@ -38,6 +38,12 @@ def quote_path(value, shell):
         return "'" + value.replace("'", "'\\''") + "'"
     if shell == "powershell":
         return "'" + "".join(ch + ch if ch in _PS_QUOTES else ch for ch in value) + "'"
+    if shell == "cmd":
+        # The value sits inside set "ROOT=..." with delayed expansion off: inside double quotes only % still means
+        # something (doubled it is literal), and a double quote cannot occur in a Windows path, so one is refused.
+        if '"' in value:
+            raise ValueError("a double quote cannot be carried in a .cmd launcher")
+        return value.replace("%", "%%")
     raise ValueError("no path literal for shell %r" % (shell,))
 
 
@@ -123,14 +129,33 @@ def _powershell(root, agents):
     return "\r\n".join(lines) + "\r\n"
 
 
-def _cmd(name):
-    # The folder path stays out of this file on purpose: cmd's % ^ & quoting is not worth the risk. It hands over to the
-    # PowerShell script beside it, and %~dp0 (this file's own folder) is how it finds that script whatever the spaces.
+def _cmd(root, agents):
+    # Pure cmd, no PowerShell: a stock Windows PC refuses every .ps1 (execution policy "Restricted"), and starting
+    # PowerShell with a policy bypass would loosen a setting the user chose. Here the first word is the program to run
+    # (`x4 claude --flag`), so the {name: command} table only supplies the usage text. The path is a set "ROOT=..."
+    # literal with % doubled and delayed expansion off, and is always shown inside double quotes.
+    commands = " ".join(dict.fromkeys(agents.values()))
     return "\r\n".join((
         "@echo off",
-        "REM %s. Hands over to %s.ps1 in this folder." % (MARKER, name),
-        'powershell -NoProfile -File "%%~dp0%s.ps1" %%*' % name,
+        "REM %s. Starts a coding agent from the install folder. Edits no PATH, no profile, no agent configuration." % MARKER,
+        "setlocal DisableDelayedExpansion",
+        'set "ROOT=%s"' % quote_path(root, "cmd"),
+        'if not exist "%ROOT%\\" goto :missing',
+        'cd /d "%ROOT%" || exit /b 2',
+        'if "%~1"=="" goto :usage',
+        'if /i "%~1"=="-h" goto :usage',
+        'if /i "%~1"=="--help" goto :usage',
+        'if /i "%~1"=="--list" goto :usage',
+        "%*",
         "exit /b %ERRORLEVEL%",
+        ":usage",
+        "echo usage: %~nx0 ^<command^> [args...]",
+        "echo starts the command in the install folder, for example: %s" % commands,
+        "exit /b 0",
+        ":missing",
+        'echo install folder not found: "%ROOT%" 1>&2',
+        "echo rewrite this launcher with the toolkit installer 1>&2",
+        "exit /b 2",
     )) + "\r\n"
 
 
@@ -148,7 +173,7 @@ def render(workspace, shell, agents, *, name="agent"):
         return _bash(root, agents)
     if shell == "powershell":
         return _powershell(root, agents)
-    return _cmd(name)
+    return _cmd(root, agents)
 
 
 def _ours(path):

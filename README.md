@@ -62,8 +62,12 @@ not a replacement for game rules. `examples/adapter.py` describes the host side.
 
 An agent loads its hooks and instructions from the folder it is started in. Started from the folder a terminal opens
 in, it runs with no guards and none of the toolkit's text, and nothing inside the toolkit can notice. `modding_harness.launcher`
-writes a small script (`NAME` for bash, `NAME.ps1`, and a `NAME.cmd` that hands over to the `.ps1`) that changes into the
-install folder and then starts an agent: `NAME <agent> [args]`, or `NAME -- <command> [args]` for any other command.
+writes small scripts that change into the
+install folder and then start an agent: `NAME` for bash and `NAME.ps1` run `NAME <agent> [args]` (or `NAME -- <command> [args]`
+for any other command); `NAME.cmd` is plain cmd, with no PowerShell, and takes the program to run as its first word
+(`NAME claude`). Microsoft documents `Restricted` as the default execution policy on Windows client PCs, which refuses every
+`.ps1` (see `about_Execution_Policies`; not measured on a stock machine here), so the `.cmd` is the one that works there
+without anyone loosening a setting; the `.ps1` needs PowerShell to allow local scripts (`RemoteSigned`).
 The toolkit supplies the agent list (`write(workspace, out_dir, {"claude": "claude"})`, or the CLI with `--agent NAME=COMMAND`);
 the core names none. It edits no PATH, no shell profile and no agent configuration, writes only the files it is asked for,
 refuses to overwrite a file it did not write, and quotes the install path for each shell. Put the output folder on your

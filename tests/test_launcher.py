@@ -51,13 +51,27 @@ class RenderTests(unittest.TestCase):
                 self.assertEqual(body.count(quote), 2 * str(smart).count(quote), quote)
         self.assertIn("Set-Location -LiteralPath $Root", text)
 
-    def test_cmd_wrapper_never_embeds_the_path(self):
+    def test_cmd_launcher_needs_no_powershell_so_no_execution_policy_can_block_it(self):
+        """A stock Windows PC refuses every .ps1 ("Restricted"); the .cmd must work there without loosening anything."""
         text = launcher.render(self.ws, "cmd", AGENTS, name="agent")
-        self.assertNotIn(str(self.ws), text)                  # cmd quoting of % ^ & is not worth the risk: it delegates
-        self.assertIn('%~dp0agent.ps1', text)
-        self.assertIn("-NoProfile", text)
-        self.assertNotIn("Bypass", text)                      # never loosens the user's execution policy
+        for word in ("powershell", "pwsh", ".ps1", "bypass", "executionpolicy"):
+            self.assertNotIn(word, text.lower())
+        self.assertIn("setlocal DisableDelayedExpansion", text)     # a "!" in the path must stay a plain character
+        self.assertIn('cd /d "%ROOT%"', text)
         self.assertTrue(text.endswith("\r\n") and "\n" not in text.replace("\r\n", ""))
+
+    def test_cmd_path_is_a_set_literal_with_every_percent_doubled(self):
+        self.assertEqual(launcher.quote_path("C:\\a b\\100%\\x&y^z(1)", "cmd"), "C:\\a b\\100%%\\x&y^z(1)")
+        text = launcher.render(self.ws, "cmd", AGENTS)
+        self.assertIn('set "ROOT=' + str(self.ws.resolve()) + '"', text)
+        for bad in ('a"b', "a\nb", "a\rb", "a\x00b", ""):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                launcher.quote_path(bad, "cmd")
+
+    def test_cmd_lists_the_commands_it_can_start(self):
+        text = launcher.render(self.ws, "cmd", AGENTS)
+        for command in AGENTS.values():
+            self.assertIn(command, text)
 
     def test_every_agent_and_the_any_command_form_are_listed(self):
         for shell in ("bash", "powershell"):
@@ -187,6 +201,44 @@ class BashBehaviourTests(unittest.TestCase):
         done = self._run("alpha")
         self.assertEqual(done.returncode, 2)
         self.assertNotIn("cwd=", done.stdout)
+        self.assertIn("not found", done.stderr)
+
+
+@unittest.skipUnless(os.name == "nt", "cmd.exe is Windows only: the generated .cmd was only checked structurally")
+class CmdBehaviourTests(unittest.TestCase):
+    """Runs the generated .cmd for real, in a folder whose name is hostile to cmd (%, ^, &, !, parentheses)."""
+
+    HOSTILE = "X4 (x86) it's [a]$b&c %PATH% ^caret! 100%"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = _workspace(self.tmp.name, self.HOSTILE)
+        self.out = Path(self.tmp.name) / "launchers"
+        launcher.write(self.ws, self.out, AGENTS, name="x4", shells=("cmd",))
+
+    def _run(self, *args):
+        return subprocess.run(["cmd.exe", "/d", "/c", str(self.out / "x4.cmd"), *args], cwd=self.tmp.name,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_starts_the_command_in_the_install_folder_from_anywhere(self):
+        done = self._run("cmd", "/c", "cd")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip().lower(), str(self.ws.resolve()).lower())
+
+    def test_the_commands_exit_code_comes_back(self):
+        self.assertEqual(self._run("cmd", "/c", "exit", "7").returncode, 7)
+
+    def test_no_argument_prints_usage_and_exits_cleanly_without_starting_anything(self):
+        done = self._run()
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("fakeagent", done.stdout)
+
+    def test_a_vanished_install_folder_starts_nothing(self):
+        shutil.rmtree(self.ws)
+        done = self._run("cmd", "/c", "echo STARTED")
+        self.assertEqual(done.returncode, 2)
+        self.assertNotIn("STARTED", done.stdout)
         self.assertIn("not found", done.stderr)
 
 
