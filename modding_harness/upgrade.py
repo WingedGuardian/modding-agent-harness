@@ -301,7 +301,7 @@ def stage_review_bundle(root, source, destination, candidate, previous=None, *, 
         pre_group_keys(groups)
     if any(not isinstance(command, str) or not command or len(command) > 32768 for command in owned) or len(owned) > 1024:
         raise ValueError("invalid verified owned command list")
-    extra = (*PROJECT_SETTINGS, ".claude/settings.local.json", "KNOWLEDGEBASE.local.md", "X4-NOTES.md",
+    extra = (*PROJECT_SETTINGS, ".claude/settings.local.json", "KNOWLEDGEBASE.local.md",
              ".modding-agent-harness/config.json", ".modding-agent-harness/local-policies.json",
              ".codex/config.toml", ".opencode/opencode.jsonc", *local_files, *generated_paths)
     originals = {row["path"]: row["installed_sha256"] for row in plan["files"] if row["installed_sha256"] is not None}
