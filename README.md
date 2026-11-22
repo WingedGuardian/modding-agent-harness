@@ -58,6 +58,17 @@ never preserves bytes or records an execution receipt. Game toolkits provide
 their own policy callback to `generic.handle`; the toy policy is an example,
 not a replacement for game rules. `examples/adapter.py` describes the host side.
 
+## Starting an agent from the install folder
+
+An agent loads its hooks and instructions from the folder it is started in. Started from the folder a terminal opens
+in, it runs with no guards and none of the toolkit's text, and nothing inside the toolkit can notice. `modding_harness.launcher`
+writes a small script (`NAME` for bash, `NAME.ps1`, and a `NAME.cmd` that hands over to the `.ps1`) that changes into the
+install folder and then starts an agent: `NAME <agent> [args]`, or `NAME -- <command> [args]` for any other command.
+The toolkit supplies the agent list (`write(workspace, out_dir, {"claude": "claude"})`, or the CLI with `--agent NAME=COMMAND`);
+the core names none. It edits no PATH, no shell profile and no agent configuration, writes only the files it is asked for,
+refuses to overwrite a file it did not write, and quotes the install path for each shell. Put the output folder on your
+PATH yourself. If the install folder moves, the script says so and starts nothing; rewrite it.
+
 `python -B -m modding_harness.charter [session-start|prompt] --workspace PATH` keeps a session's origin and its
 ledger across context compaction for Claude Code and Codex, in `.agent-sessions/` (outside the guarded
 `.modding-agent-harness/`; toolkits gitignore it). Register `prompt` on UserPromptSubmit: a session's first prompt
