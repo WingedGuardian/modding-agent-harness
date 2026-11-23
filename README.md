@@ -221,6 +221,42 @@ file an upgrade never replaces) or `MODDING_HARNESS_UPDATE_CHECK=off` turns it o
 `config.json`, which an older core refuses unknown keys in: a rollback past this version would otherwise break the
 save store.
 
+## Guarded updates
+
+`modding_harness.guarded_update` is the apply half: it wraps `release.fetch` and the reviewed upgrader and replaces
+neither. A toolkit adds `update_review.UpdatePolicy(guard_paths, policy_files, setup, canary, render_config)` next to
+its `ReleaseProfile`, and wires `guarded_update.add_arguments` / `handle` / `exit_code` / `session_note` next to
+`release.add_arguments`. It also supplies a candidate preparer and validator, so hook files are rendered for the install
+before review (the apply validator refuses unrendered hook files). The profile, the policy and those hooks are code in
+the INSTALLED toolkit; the downloaded release cannot choose its own repository, setup or canary.
+
+Two steps, and the second needs the user:
+
+1. `update-stage` fetches the newest release and prints a review: guard, hook, settings and policy-file changes as
+   unified diffs, everything else as a list, and the exact `update-apply` command. It installs and authorizes nothing.
+2. After the user says go, run that command: `update-apply --bundle DIR --review-sha256 SHA --choices FILE
+   [--accept-guard-changes] --quiescent`. If the review changes guard code, a policy file or hook settings, apply also
+   refuses without `--accept-guard-changes`: the user's SEPARATE go for those changes. Every collision needs a choice
+   (`keep`, `candidate`, `merged_settings`) in the choices file.
+
+Apply runs the toolkit's setup, then its canary (and the old canary too when a policy file changed), each an argv with no
+shell, timeout 600 s. A nonzero exit, a timeout or a missing executable fails the step. A failure rolls the operation
+back automatically and runs the old canary on the restored install. Exit codes (`exit_code`): 0 ok, 1 the update did
+not succeed (rolled back, or failed closed), 2 a refusal before anything changed.
+
+- Run `update-apply` in the BACKGROUND: setup and canary may each take 600 s, and an agent's foreground command is
+  killed at 10 minutes.
+- Two files in `.modding-agent-harness/` fail closed; `session_note(root)` prints one line while either exists, and
+  `update-stage` and `update-apply` refuse. `update-failed.json`: a rollback or the old canary failed afterwards, so the
+  guards may be broken. `update-in-flight.json`: an apply started and never reached a final outcome (a kill, an
+  interrupt), so an unverified guard set may be live. The user reads it, fixes the cause (roll back the named operation
+  with `upgrade-rollback`, or run the canary), then `update-clear-failed` sets both aside, renamed and kept.
+- A plain core `upgrade-apply` BYPASSES these markers and the canary: only the `update-*` commands honour them.
+- There is no active-session registry, so the caller asserts `--quiescent` (host and editor writers stopped); the flag
+  stops nothing. A running agent may keep the hooks it loaded until it restarts.
+- Verification is GitHub's published digest and the release's `BUILD-INFO` only: an attacker holding the repository
+  account controls both. The core cannot tell who typed the go; it checks the flags, never the person.
+
 ## Development CI
 
 Start with a draft pull request for fast checks. Mark it ready for complete qualification; see [Contributing](CONTRIBUTING.md).

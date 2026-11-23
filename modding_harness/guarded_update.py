@@ -11,6 +11,9 @@ operation back and runs the old canary on the restored state. When that fails to
 
 Everything that decides what counts as guard code comes from the INSTALLED toolkit (`ReleaseProfile`,
 `UpdatePolicy`), never from the downloaded release.
+
+COMMAND LINE (last section): `add_arguments` / `handle` / `exit_code` / `session_note` are what a toolkit wires next to
+`release.add_arguments`. Everything above is the library; the section at the end is only the thin surface over it.
 """
 from __future__ import annotations
 
@@ -544,3 +547,115 @@ def _recover(root, old_canary, runner, notes_files, operation, steps, failed, be
             root / _JOURNALS / operation))
     lines += ["  setup's effects outside the install root (deployed copies, for example) are not tracked here.", ""]
     return Applied(False, operation, rolled_back, "\n".join(lines) + "\n")
+
+
+# --- command line ---------------------------------------------------------------------------------------------------
+
+COMMANDS = frozenset(("update-stage", "update-apply", "update-clear-failed"))
+_MAX_CHOICES = 1024 * 1024
+
+
+def add_arguments(subparsers):
+    """Register the three commands. `update-apply` takes exactly what the printed review's `next:` block tells the
+    agent to run: `update-apply --bundle DIR --review-sha256 SHA --choices FILE [--accept-guard-changes] --quiescent`."""
+    staging = subparsers.add_parser("update-stage", help="fetch the newest release and stage it for review; "
+                                    "installs and authorizes nothing")
+    applying = subparsers.add_parser("update-apply", help="apply a staged update after the user's go, then run setup "
+                                     "and canary; rolls back on failure")
+    applying.add_argument("--bundle", required=True, type=Path)
+    applying.add_argument("--review-sha256", required=True)
+    applying.add_argument("--choices", type=Path, help="JSON: keep/candidate/merged_settings for every collision")
+    applying.add_argument("--accept-guard-changes", action="store_true",
+                          help="the user's separate go for guard, hook, settings or policy-file changes")
+    applying.add_argument("--quiescent", action="store_true", required=True,
+                          help="host/editor writers have been stopped; this flag does not stop them")
+    clearing = subparsers.add_parser("update-clear-failed", help="set the failed and in-flight markers aside after the "
+                                     "user has read them and fixed the cause")
+    for parser in (staging, applying, clearing):
+        parser.add_argument("--installed-root", type=Path)
+
+
+def _choices(path):
+    if path is None:
+        return {}
+    try:
+        with Path(path).open("rb") as stream:
+            return transport.load(stream.read(_MAX_CHOICES + 1))
+    except (OSError, ValueError) as exc:
+        raise UpdateRefused("the choices file cannot be read: {}; nothing was changed".format(exc)) from exc
+
+
+def handle(args, root, profile, policy, *, notes_files=(), candidate_preparer=None, candidate_validator=None,
+           generated_paths=(), new_policy=None, http=None):
+    """Run one parsed `update-*` command and return a JSON-able dict, or raise `UpdateRefused` / `OSError`.
+
+    The toolkit supplies `profile` (`release.ReleaseProfile`), `policy` (`UpdatePolicy`) and its renderer hooks
+    (`candidate_preparer`, `candidate_validator`, `generated_paths`, `new_policy`); none of it comes from the
+    downloaded release. Turn the result into a process exit code with `exit_code`.
+    """
+    root = Path(args.installed_root or root)
+    if args.command == "update-stage":
+        staged = stage_update(root, profile, policy, notes_files=notes_files, http=http,
+                              candidate_preparer=candidate_preparer, generated_paths=generated_paths)
+        return {"bundle": str(staged.bundle), "review_sha256": staged.review_sha256,
+                "requires_guard_accept": staged.requires_guard_accept, "from_version": staged.from_version,
+                "to_version": staged.to_version, "application_authorized": False, "review": staged.text}
+    if args.command == "update-apply":
+        applied = apply_update(root, policy, args.bundle, args.review_sha256, _choices(args.choices),
+                               accept_guard_changes=args.accept_guard_changes, quiescent=args.quiescent,
+                               notes_files=notes_files, new_policy=new_policy, candidate_validator=candidate_validator)
+        return {"ok": applied.ok, "operation": applied.operation, "rolled_back": applied.rolled_back,
+                "report": applied.report}
+    if args.command == "update-clear-failed":
+        resolved = Path(root).resolve()
+        present = [name for name in (FAILED_MARKER, IN_FLIGHT) if _present(resolved / name)]
+        clear_failed(root)
+        return {"cleared": present}
+    raise ValueError("not a guarded update command")
+
+
+def exit_code(result):
+    """The process exit code for what `handle` returned or raised (the toolkit's main maps it with this):
+
+    0  ok: a stage or clear result, or an apply whose setup and canary passed (`ok` true).
+    1  the update did not succeed after work began: an apply with `ok` false (rolled back, or the fail-closed marker
+       was written), or any unexpected error, whose outcome is unknown (read `update-in-flight.json`).
+    2  a refusal before anything changed: `UpdateRefused`, `OSError`, `ValueError`.
+    Anything that is neither a result nor an exception is a bug in the caller (TypeError).
+    """
+    if isinstance(result, (UpdateRefused, OSError, ValueError)):
+        return 2
+    if isinstance(result, BaseException):
+        return 1
+    if isinstance(result, Applied):
+        return 0 if result.ok is True else 1
+    if isinstance(result, dict):
+        return 0 if result.get("ok", True) is True else 1     # a stage or clear result carries no `ok`
+    raise TypeError("exit_code takes a handle result or an exception, not {}".format(type(result).__name__))
+
+
+def session_note(root):
+    """One loud line while the failed marker or the in-flight record exists, else None. Never raises: a state it
+    cannot read is reported as unknown, never as fine. A toolkit's session-start hook prints it beside `release.note`."""
+    try:
+        found = []
+        meaning = {FAILED_MARKER: "an update failed and could not be rolled back and verified: the guards may be "
+                                  "broken or missing",
+                   IN_FLIGHT: "an update was interrupted before its outcome was known: an unverified guard set "
+                              "may be live"}
+        for name in (FAILED_MARKER, IN_FLIGHT):
+            try:
+                os.lstat(Path(root) / name)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                found.append("{} could not be read, so treat it as present".format(name))
+                continue
+            found.append("{} exists: {}".format(name, meaning[name]))
+        if not found:
+            return None
+        return ("TOOLKIT UPDATE NEEDS THE USER: {}. Do not update or trust the hooks; tell the user now. They read the "
+                "file, fix the cause, then clear it with update-clear-failed.".format("; ".join(found)))
+    except Exception as exc:
+        return ("TOOLKIT UPDATE STATE UNKNOWN: could not check for {} or {} ({}). Tell the user before updating."
+                .format(FAILED_MARKER, IN_FLIGHT, type(exc).__name__))
