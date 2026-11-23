@@ -31,6 +31,19 @@ _QUIET = ("unchanged", "absent_retired")
 KEEPS_INSTALLED = ("preserve_collision", "preserve_local")   # actions whose default outcome keeps the installed bytes
 
 
+CONDITIONAL_HEADING = "Only if you choose `candidate`"
+_DRIVE = re.compile(r"[A-Za-z]:")
+
+
+def _posix_relative(value, what):
+    """A posix-relative path or glob, or ValueError: a backslash, an absolute path, a drive or `..` would make a glob
+    that silently matches nothing, so every hook change would stop counting as a guard change."""
+    if (not isinstance(value, str) or not value or "\\" in value or value.startswith("/") or _DRIVE.match(value)
+            or ".." in value.split("/")):
+        raise ValueError("{} must be a non-empty posix-relative path (no backslash, no leading /, no drive, no ..): "
+                         "{!r}".format(what, value))
+
+
 @dataclass(frozen=True)
 class UpdatePolicy:
     guard_paths: tuple[str, ...]                # fnmatch globs, posix-relative, matched case-insensitively
@@ -38,6 +51,18 @@ class UpdatePolicy:
     setup: tuple[str, ...]                      # argv of the setup step
     canary: tuple[str, ...]                     # argv of the canary
     render_config: Callable[[Path], Path]       # the toolkit's render configuration for an install root
+
+    def __post_init__(self):
+        if not isinstance(self.guard_paths, (tuple, list)) or not self.guard_paths:
+            raise ValueError("guard_paths must be a non-empty tuple of posix-relative globs")
+        if not isinstance(self.policy_files, (tuple, list)):
+            raise ValueError("policy_files must be a tuple of posix-relative paths")
+        for glob in self.guard_paths:
+            _posix_relative(glob, "a guard glob")
+        for name in self.policy_files:
+            _posix_relative(name, "a policy file")
+        object.__setattr__(self, "guard_paths", tuple(self.guard_paths))
+        object.__setattr__(self, "policy_files", tuple(self.policy_files))
 
 
 def _is_guard_path(path, policy):
@@ -65,6 +90,14 @@ def classify(rows, policy):
     for row in rows:
         (guard if _is_guard_path(row["path"], policy) and _changes_bytes(row) else other).append(row)
     return guard, other
+
+
+def conditional_guard_rows(rows, policy):
+    """Guard-path rows `classify` exempts only because their default outcome keeps the user's bytes (a local edit the
+    release did not touch): choosing `candidate` on one would still replace guard code, so that choice needs the guard
+    go. Rows whose candidate bytes equal the installed bytes change nothing either way."""
+    return [row for row in rows if _is_guard_path(row["path"], policy) and not _changes_bytes(row)
+            and row.get("candidate_sha256") is not None and row.get("candidate_sha256") != row.get("installed_sha256")]
 
 
 def _validated_rows(review):
@@ -121,18 +154,28 @@ def _diff_lines(name, old, new, old_label, new_label):
 
 
 def _quote(argument):
-    return '"{}"'.format(argument) if not argument or re.search(r"[\s()&^%\"]", argument) else argument
+    """One argument as a POSIX shell word (Git Bash, the agent's usual shell): bare when it is plainly safe, otherwise
+    in single quotes, which keep backslashes, `$`, backticks and parentheses literal."""
+    if argument and re.fullmatch(r"[A-Za-z0-9_./:=@%+,-]+", argument):
+        return argument
+    return "'" + argument.replace("'", "'\"'\"'") + "'"
 
 
-def _next_block(bundle, review_sha256, requires_accept):
-    command = "update-apply --bundle {} --review-sha256 {} --choices <file>{} --quiescent".format(
-        _quote(str(bundle)), review_sha256, " --accept-guard-changes" if requires_accept else "")
+def _next_block(bundle, review_sha256, requires_accept, conditional=()):
+    bundle = Path(bundle)
+    choices = (bundle.parent / "choices.json").as_posix()
+    command = "update-apply --bundle {} --review-sha256 {} --choices {}{} --quiescent".format(
+        _quote(bundle.as_posix()), review_sha256, _quote(choices), " --accept-guard-changes" if requires_accept else "")
     steps = ["next:", "  1. Show the user this review, with every guard diff above in full."]
     if requires_accept:
         steps.append("  2. The review changes guard code, policy or hook settings: the user must give a separate, "
                      "explicit go for those changes, not only for the update.")
-    steps += ["  {}. Write the user's keep/candidate/merged_settings choice for every collision and merged settings "
-              "file into the choices file.".format(len(steps)),
+    if conditional:
+        steps.append("  {}. Choosing `candidate` for a file under \"{}\" replaces guard code too: it needs the same "
+                     "separate go and --accept-guard-changes.".format(len(steps), CONDITIONAL_HEADING))
+    steps += ["  {}. Before running the command, the agent writes the user's keep/candidate/merged_settings choice for "
+              "every collision and merged settings file, as one JSON object, into this file: {}".format(
+                  len(steps), choices),
               "  {}. Only after the user says go, run exactly:".format(len(steps) + 1),
               "       " + command,
               "     Do not run it until the user says go."]
@@ -157,8 +200,7 @@ def render_review(*, bundle, installed_root, source, policy, review_sha256):
     staged = review.get("candidate_files") if isinstance(review.get("candidate_files"), dict) else {}
     guard, other = classify(rows, policy)
 
-    sections = []
-    for row in guard:
+    def diff_block(row):
         name, candidate = row["path"], row.get("candidate_sha256")
         old = _read(installed_root, name, row.get("installed_sha256"), "installed")
         new = b""
@@ -168,8 +210,11 @@ def render_review(*, bundle, installed_root, source, policy, review_sha256):
             copy = upgrade._entry(bundle, "candidate/" + name)
             new = (_read(bundle / "candidate", name, staged.get(name, candidate), "staged candidate") if copy.exists()
                    else _read(source, name, candidate, "release"))
-        sections.append(["  {}  [{}]".format(name, row["action"])] +
-                        ["    " + line for line in _diff_lines(name, old, new, "installed", "candidate")])
+        return (["  {}  [{}]".format(name, row["action"])] +
+                ["    " + line for line in _diff_lines(name, old, new, "installed", "candidate")])
+
+    sections = [diff_block(row) for row in guard]
+    conditional = [diff_block(row) for row in conditional_guard_rows(rows, policy)]
 
     settings = []
     merged = review.get("merged_settings_hashes")
@@ -196,6 +241,20 @@ def render_review(*, bundle, installed_root, source, policy, review_sha256):
             text += block + [""]
     else:
         text += ["No guard, hook, settings or policy change.", ""]
+    if conditional:
+        text.append("{} ({}): guard files you changed yourself that the release did not touch. `keep` (lossless) needs "
+                    "nothing; choosing `candidate` replaces your copy with the release's and needs the same separate go "
+                    "(--accept-guard-changes).".format(CONDITIONAL_HEADING, len(conditional)))
+        for block in conditional:
+            text += block + [""]
+    matched = [row for row in rows if any(fnmatch.fnmatchcase(row["path"].casefold(), glob.casefold())
+                                          for glob in policy.guard_paths)]
+    text.append("guard globs matched {} of {} paths".format(len(matched), len(rows)))
+    for glob in policy.guard_paths:
+        if not any(fnmatch.fnmatchcase(row["path"].casefold(), glob.casefold()) for row in rows):
+            text.append("WARNING: guard glob {} matched no path in this release; check the toolkit's UpdatePolicy if "
+                        "that is unexpected".format(glob))
+    text.append("")
     quiet = [row for row in other if row["action"] in _QUIET]
     listed = [row for row in other if row["action"] not in _QUIET]
     text.append("Other changes ({}):".format(len(listed)))
@@ -209,4 +268,4 @@ def render_review(*, bundle, installed_root, source, policy, review_sha256):
     if quiet:
         text.append("  {} unchanged or already absent file(s) not listed.".format(len(quiet)))
     text.append("")
-    return "\n".join(text + _next_block(bundle, review_sha256, requires_accept)) + "\n", requires_accept
+    return "\n".join(text + _next_block(bundle, review_sha256, requires_accept, conditional)) + "\n", requires_accept

@@ -5,6 +5,7 @@ run, so each test names exactly the row it is about.
 """
 import hashlib
 import json
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -76,9 +77,14 @@ class ClassifyTests(unittest.TestCase):
             self.assertEqual(guard, [])
             self.assertEqual([r["path"] for r in other], [HOOK])
             (text, accept), _ = fx.render()
-            self.assertFalse(accept)
+            self.assertFalse(accept)                         # keep is lossless and stays free
             self.assertIn("unchanged upstream, keep is lossless", text)
-            self.assertNotIn("@@", text)
+            # Choosing `candidate` would replace the user's own hook: that diff is shown under its own heading.
+            conditional = text.split(update_review.CONDITIONAL_HEADING, 1)[1].split("Other changes", 1)[0]
+            self.assertIn(HOOK, conditional)
+            self.assertIn("-user edit", conditional)
+            self.assertIn("+old", conditional)
+            self.assertNotIn("GUARD CHANGES", text)
 
     def test_deleted_guard_hook_that_apply_would_recreate_is_a_guard_change(self):
         # The user removed a hook both releases ship: preview emits `create` (candidate == previous, installed absent)
@@ -100,6 +106,20 @@ class ClassifyTests(unittest.TestCase):
             fx.row(HOOK, "preserve_local", installed=b"mine\n", previous=b"old\n", candidate=b"old\n")
             guard, _ = classify(fx.rows, policy())
             self.assertEqual(guard, [])
+            self.assertEqual([r["path"] for r in update_review.conditional_guard_rows(fx.rows, policy())], [HOOK])
+            (text, accept), _ = fx.render()
+            self.assertFalse(accept)
+            self.assertIn("-mine", text.split(update_review.CONDITIONAL_HEADING, 1)[1])
+
+    def test_conditional_rows_are_only_kept_guard_files_whose_candidate_differs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fx = Fixture(folder)
+            fx.row(POLICY_FILE, "preserve_collision", installed=b"{1}\n", previous=b"{0}\n", candidate=b"{0}\n")
+            fx.row(".claude/hooks/same.py", "preserve_collision", installed=b"x\n", previous=b"y\n", candidate=b"x\n")
+            fx.row("docs/a.md", "preserve_collision", installed=b"mine\n", previous=b"old\n", candidate=b"old\n")
+            fx.row(".claude/hooks/changed.py", "preserve_collision", installed=b"m\n", previous=b"o\n", candidate=b"n\n")
+            names = [r["path"] for r in update_review.conditional_guard_rows(fx.rows, policy())]
+            self.assertEqual(names, [POLICY_FILE])          # same bytes: no change; docs: not guard; changed: a guard row
 
     def test_guard_row_needs_different_bytes_not_just_a_matching_path(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -187,6 +207,10 @@ class RenderTests(unittest.TestCase):
             self.assertIn("+line 0", text)
             self.assertNotIn("+line 999", text)
 
+    def command(self, text):
+        lines = text.splitlines()
+        return next(lines[i + 1] for i, line in enumerate(lines) if line.strip().endswith("run exactly:")).strip()
+
     def test_next_block_has_exact_command_hash_and_flag_only_when_required(self):
         with tempfile.TemporaryDirectory() as folder:
             fx = Fixture(folder)
@@ -194,8 +218,9 @@ class RenderTests(unittest.TestCase):
             (text, accept), digest = fx.render()
             self.assertTrue(accept)
             block = text[text.index("next:"):]
-            self.assertIn("update-apply --bundle {} --review-sha256 {} --choices <file> --accept-guard-changes "
-                          "--quiescent".format(fx.bundle, digest), block)
+            self.assertEqual(shlex.split(self.command(text)), [
+                "update-apply", "--bundle", fx.bundle.resolve().as_posix(), "--review-sha256", digest, "--choices",
+                (fx.bundle.resolve().parent / "choices.json").as_posix(), "--accept-guard-changes", "--quiescent"])
             self.assertIn("do not run it until the user says go", block.lower())
         with tempfile.TemporaryDirectory() as folder:
             fx = Fixture(folder)
@@ -203,10 +228,53 @@ class RenderTests(unittest.TestCase):
             (text, accept), digest = fx.render()
             self.assertFalse(accept)
             block = text[text.index("next:"):]
-            self.assertIn("update-apply --bundle {} --review-sha256 {} --choices <file> --quiescent".format(
-                fx.bundle, digest), block)
+            self.assertEqual(shlex.split(self.command(text))[-1], "--quiescent")
             self.assertNotIn("--accept-guard-changes", text)
             self.assertIn("do not run it until the user says go", block.lower())
+
+    def test_printed_command_survives_bash_for_the_default_windows_path_shape(self):
+        # The default updates folder has no spaces but (on Windows) backslashes; bash would eat them unquoted.
+        with tempfile.TemporaryDirectory() as folder:
+            fx = Fixture(folder)
+            fx.row("docs/a.md", "create", candidate=b"x\n")
+            (text, _), digest = fx.render()
+            argv = shlex.split(self.command(text))
+            self.assertNotIn(" ", str(fx.bundle.resolve()))                      # the shape under test
+            self.assertEqual(Path(argv[argv.index("--bundle") + 1]), fx.bundle.resolve())
+            choices = argv[argv.index("--choices") + 1]
+            self.assertEqual(Path(choices), fx.bundle.resolve().parent / "choices.json")
+            self.assertNotIn("<", self.command(text))                            # no placeholder a shell would redirect
+            self.assertIn(choices, text.split("run exactly:", 1)[0])             # the step that says to write it names it
+        for odd in ("it's here", "a $HOME b", "back`tick", "(x86) dir"):
+            with self.subTest(odd), tempfile.TemporaryDirectory() as folder:
+                fx = Fixture(Path(folder))
+                fx.bundle = Path(folder) / odd / "review"
+                fx.bundle.mkdir(parents=True)
+                fx.row("docs/a.md", "create", candidate=b"x\n")
+                (text, _), digest = fx.render()
+                argv = shlex.split(self.command(text))
+                self.assertEqual(Path(argv[argv.index("--bundle") + 1]), fx.bundle.resolve())
+
+    def test_policy_paths_are_validated(self):
+        good = dict(policy_files=(POLICY_FILE,), setup=("x",), canary=("x",), render_config=lambda root: root)
+        for bad in ((), (".claude\\hooks\\*",), ("/abs/*",), ("C:/x/*",), ("a/../b",), ("",), (5,), ".claude/*"):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                UpdatePolicy(guard_paths=bad, **good)
+        for bad in (("tools\\p.json",), ("/p.json",), ("../p.json",), ("",)):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                UpdatePolicy(guard_paths=(".claude/*",), **{**good, "policy_files": bad})
+        UpdatePolicy(guard_paths=(".claude/hooks/*",), **{**good, "policy_files": ()})
+
+    def test_review_prints_glob_coverage_and_warns_for_a_glob_that_matches_nothing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fx = Fixture(folder)
+            fx.row(HOOK, "unchanged", installed=b"a\n", previous=b"a\n", candidate=b"a\n")
+            fx.row("docs/a.md", "create", candidate=b"x\n")
+            (text, accept), _ = fx.render()
+            self.assertFalse(accept)                                             # a warning, never a refusal
+            self.assertIn("guard globs matched 1 of 2 paths", text)
+            self.assertIn("WARNING: guard glob .claude/settings.json matched no path in this release", text)
+            self.assertNotIn("WARNING: guard glob .claude/hooks/*", text)
 
     def test_non_guard_changes_alone_do_not_require_accept(self):
         with tempfile.TemporaryDirectory() as folder:
