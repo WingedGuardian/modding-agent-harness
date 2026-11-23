@@ -205,7 +205,9 @@ name with `{version}` in it, how the note names it, and a function that reads th
   numerically. Offline or any bad answer is quiet and is retried the next day; `check` never raises.
 - `release.note(root, profile)` reads only that cache and returns one line, once per new version, for the toolkit's
   session start to show. A session start never waits on the network: run `check` in a detached background helper.
-- `update-fetch` downloads the release's zip into `.modding-agent-harness/updates/<version>/` and refuses it unless:
+- `update-fetch` downloads the release's zip into a per-user folder OUTSIDE the install (the reviewed upgrader
+  refuses a bundle or source inside the root it upgrades): `release.updates_home`, under
+  `%LOCALAPPDATA%/modding-agent-harness/updates/<install id>/<version>/` (Linux: `~/.local/share/...`), and refuses it unless:
   the asset's address is this repository's release download; its SHA-256 matches the digest GitHub publishes for the
   asset (no digest, no download); every entry sits under one folder with no link, absolute, drive or `..` name and no
   case-folded duplicate (the upgrader's own inventory rules); and the unpacked `BUILD-INFO` names the release's

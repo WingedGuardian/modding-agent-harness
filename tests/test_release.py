@@ -5,6 +5,7 @@ instead of reaching GitHub.
 """
 import hashlib
 import io
+import os
 import json
 import stat
 import tempfile
@@ -91,6 +92,9 @@ class Base(unittest.TestCase):
         patcher = mock.patch.object(urllib.request, "urlopen", _no_network)
         patcher.start()
         self.addCleanup(patcher.stop)
+        updates = mock.patch.dict(os.environ, {"MODDING_HARNESS_UPDATES_DIR": str(Path(self.tmp.name) / "updates")})
+        updates.start()
+        self.addCleanup(updates.stop)
         self.env = {}
 
     def installed_bytes(self):
@@ -178,6 +182,21 @@ class FetchTests(Base):
         self.assertEqual(candidate["files"]["setup.sh"], hashlib.sha256(b"echo setup\n").hexdigest())
         self.assertTrue((Path(out["source"]) / "tools/a.py").is_file())
 
+    def test_downloads_and_the_review_bundle_live_outside_the_install(self):
+        """The reviewed upgrader refuses a bundle or source inside the root it upgrades (found by the E2E run)."""
+        out = release.fetch(self.root, profile(), FakeGitHub())
+        for key in ("zip", "source", "candidate", "bundle"):
+            self.assertNotIn(self.root.resolve(), Path(out[key]).resolve().parents, key)
+
+    def test_two_installs_never_share_an_update_folder(self):
+        other = Path(self.tmp.name) / "other install"
+        other.mkdir()
+        self.assertNotEqual(release.updates_home(self.root), release.updates_home(other))
+
+    def test_an_update_folder_inside_the_install_refuses(self):
+        with self.assertRaisesRegex(ValueError, "outside the install"):
+            release.updates_home(self.root, {"MODDING_HARNESS_UPDATES_DIR": str(self.root / "updates")})
+
     def test_the_installed_release_s_own_inventory_becomes_previous(self):
         out = release.fetch(self.root, profile(), FakeGitHub())
         previous = json.loads(Path(out["previous"]).read_text())
@@ -196,7 +215,7 @@ class FetchTests(Base):
         gh = FakeGitHub(digest="sha256:" + "0" * 64)
         with self.assertRaisesRegex(ValueError, "SHA-256 does not match"):
             release.fetch(self.root, profile(), gh)
-        self.assertEqual(list((self.root / release.UPDATES).rglob("*.zip")), [])
+        self.assertEqual(list(release.updates_home(self.root).rglob("*.zip")), [])
 
     def test_no_published_digest_refuses(self):
         with self.assertRaisesRegex(ValueError, "no SHA-256 digest"):
