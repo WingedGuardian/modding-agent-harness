@@ -189,6 +189,34 @@ also retains its separate final manifest/blob verification.
 
 Core fixtures do not certify host enforcement or native game round-trips.
 
+## Updates from GitHub
+
+Users find a toolkit on Nexus and download it there the first time; later updates come from the toolkit's GitHub
+releases, through the agent. `modding_harness.release` finds and fetches a release and never installs anything:
+applying stays with the reviewed upgrade commands above, so the user sees their own changed files before anything is
+replaced, and every applied update keeps its rollback journal.
+
+A toolkit supplies a `ReleaseProfile(repo, asset, product, installed_version)`: its `owner/name` repository, its zip's
+name with `{version}` in it, how the note names it, and a function that reads the installed version (a release zip's
+`BUILD-INFO` is read by `release.build_info`). It wires `release.add_arguments` / `release.handle` into its own entry:
+
+- `update-check [--now]` asks GitHub's API for the latest release at most once a day (`--now` asks anyway) and caches
+  the answer in `.modding-agent-harness/update-check.json`. Drafts and prereleases are not offered; versions compare
+  numerically. Offline or any bad answer is quiet and is retried the next day; `check` never raises.
+- `release.note(root, profile)` reads only that cache and returns one line, once per new version, for the toolkit's
+  session start to show. A session start never waits on the network: run `check` in a detached background helper.
+- `update-fetch` downloads the release's zip into `.modding-agent-harness/updates/<version>/` and refuses it unless:
+  the asset's address is this repository's release download; its SHA-256 matches the digest GitHub publishes for the
+  asset (no digest, no download); every entry sits under one folder with no link, absolute, drive or `..` name and no
+  case-folded duplicate (the upgrader's own inventory rules); and the unpacked `BUILD-INFO` names the release's
+  version and the commit its tag points at. It prints the `--source` and `--candidate` paths for `upgrade-preview` and
+  `upgrade-stage`. Nothing installed changes.
+
+Checking is on by default. `{"v": 1, "check": false}` in `.modding-agent-harness/updates.json` (a protected local
+file an upgrade never replaces) or `MODDING_HARNESS_UPDATE_CHECK=off` turns it off. The setting is deliberately not in
+`config.json`, which an older core refuses unknown keys in: a rollback past this version would otherwise break the
+save store.
+
 ## Development CI
 
 Start with a draft pull request for fast checks. Mark it ready for complete qualification; see [Contributing](CONTRIBUTING.md).
