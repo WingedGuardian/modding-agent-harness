@@ -5,6 +5,7 @@ one JSON line per run to a log, and pass or fail by a rule given on their comman
 steps ran, in which order, in which folder and with which arguments. The fake install and fake release are the stage
 tests' own (`tests/test_guarded_update_stage.py`, through the `http` seam of `tests/test_release.py`).
 """
+import contextlib
 import hashlib
 import json
 import subprocess
@@ -17,6 +18,8 @@ from modding_harness import guarded_update, installation, upgrade
 from modding_harness.locking import exclusive
 from modding_harness.update_review import UpdatePolicy
 from test_guarded_update_stage import FAILED, HOOK, NEW, OLD, POLICY_FILE, Base, sha
+
+INFLIGHT = ".modding-agent-harness/update-in-flight.json"
 
 STEP = textwrap.dedent("""\
     import json, os, sys
@@ -175,6 +178,7 @@ class RefusalTests(ApplyBase):
         self.assertEqual(self.journals(), [])
         self.assertEqual(self.steps(), [])
         self.assertFalse((self.root / FAILED).exists())
+        self.assertFalse((self.root / INFLIGHT).exists())                           # a clean refusal is final
 
     def test_refuses_while_failed_marker_present(self):
         staged = self.staged()
@@ -423,6 +427,225 @@ class RunTests(ApplyBase):
         self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
         if sys.platform == "win32":
             self.assertTrue(kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW)
+
+
+def foreign_journal(root, review="f" * 64):
+    """Another updater's operation journal, with a publication intent, as `installation.apply` would leave it."""
+    operation = "e" * 32
+    journal = root / ".modding-agent-harness/upgrades" / operation
+    journal.mkdir(parents=True)
+    (journal / "plan.json").write_text(json.dumps({"v": 1, "root": str(root.resolve()), "review_sha256": review,
+                                                   "changes": [], "ordered_integration": None}))
+    (journal / "000001-intent.json").write_text(json.dumps({"v": 1, "path": "x", "identity": [1, 2, 3, 4, 5]}))
+    return journal
+
+
+class ConcurrencyAndInFlightTests(ApplyBase):
+    def files_in(self, folder):
+        return {p.relative_to(folder).as_posix(): p.read_bytes() for p in folder.rglob("*") if p.is_file()}
+
+    def test_foreign_journal_created_during_the_lock_wait_is_not_rolled_back(self):
+        staged = self.staged({NEW + HOOK: b"guard v2\n"})
+        before = self.installed()
+        made = []
+
+        @contextlib.contextmanager
+        def busy(path, wait=5.0):
+            made.append(foreign_journal(self.root))         # updater B took the lock and published meanwhile
+            raise TimeoutError("preservation/cache lock is busy")
+            yield
+        with mock.patch.object(installation, "exclusive", busy), \
+                mock.patch.object(installation, "rollback", wraps=installation.rollback) as rollback:
+            with self.assertRaisesRegex(guarded_update.UpdateRefused, "upgrade.lock"):
+                self.apply(staged, accept_guard_changes=True)
+        self.assertEqual(rollback.call_count, 0)
+        foreign = self.files_in(made[0])
+        self.assertEqual(sorted(foreign), ["000001-intent.json", "plan.json"])      # untouched, no rollback receipt
+        self.assertEqual(self.installed(), before)
+        self.assertFalse((self.root / FAILED).exists())
+        self.assertFalse((self.root / INFLIGHT).exists())
+        self.assertEqual(self.steps(), [])
+
+    def test_partial_failure_rolls_back_only_its_own_operation(self):
+        staged = self.staged({NEW + HOOK: b"guard v2\n"})
+        before = self.installed()
+        real = installation.durable.atomic_json
+        made = []
+
+        def fail_on_second_publish(path, data):
+            if Path(path).name == "000002-published.json":
+                made.append(foreign_journal(self.root))     # a second new journal appears before the failure
+                raise OSError("simulated crash after a partial publish")
+            return real(path, data)
+        with mock.patch.object(installation.durable, "atomic_json", side_effect=fail_on_second_publish):
+            applied = self.apply(staged, accept_guard_changes=True)
+        self.assertFalse(applied.ok)
+        self.assertTrue(applied.rolled_back)
+        self.assertNotEqual(applied.operation, made[0].name)
+        self.assertEqual(self.installed(), before)
+        self.assertEqual(sorted(self.files_in(made[0])), ["000001-intent.json", "plan.json"])
+        self.assertFalse((self.root / FAILED).exists())
+        self.assertFalse((self.root / INFLIGHT).exists())
+
+    def test_an_apply_failure_naming_no_journal_of_ours_fails_closed(self):
+        staged = self.staged({NEW + HOOK: b"guard v2\n"})
+        failure = installation.UpgradeFailed("upgrade failed; published=['x']; journal=/nowhere: boom")
+        with mock.patch.object(installation, "apply", side_effect=failure):
+            applied = self.apply(staged, accept_guard_changes=True)
+        self.assertFalse(applied.ok)
+        self.assertFalse(applied.rolled_back)
+        self.assertNotIn("nothing was changed", applied.report)
+        marker = json.loads((self.root / FAILED).read_text(encoding="utf-8"))
+        self.assertEqual(marker["failed_step"], "apply")
+        self.assertIn("boom", marker["error"])
+        self.assertFalse((self.root / INFLIGHT).exists())                           # the marker took its place
+
+    def test_a_failure_naming_a_foreign_journal_is_not_rolled_back(self):
+        staged = self.staged({NEW + HOOK: b"guard v2\n"})
+        journal = foreign_journal(self.root)                # right place and shape, but another review's plan
+        failure = installation.UpgradeFailed("upgrade failed; published=['x']; journal={}: boom".format(journal))
+        with mock.patch.object(installation, "apply", side_effect=failure), \
+                mock.patch.object(installation, "rollback") as rollback:
+            applied = self.apply(staged, accept_guard_changes=True)
+        self.assertEqual(rollback.call_count, 0)
+        self.assertFalse(applied.ok)
+        self.assertEqual(json.loads((self.root / FAILED).read_text(encoding="utf-8"))["failed_step"], "apply")
+        self.assertEqual(sorted(self.files_in(journal)), ["000001-intent.json", "plan.json"])
+
+    def test_an_apply_failure_before_any_publication_is_a_clean_refusal(self):
+        staged = self.staged({NEW + HOOK: b"guard v2\n"})
+        before = self.installed()
+        real = installation.durable.atomic_json
+
+        def fail_first_intent(path, data):
+            if Path(path).name == "000001-intent.json":
+                raise OSError("simulated failure before the first publication")
+            return real(path, data)
+        with mock.patch.object(installation.durable, "atomic_json", side_effect=fail_first_intent):
+            with self.assertRaisesRegex(guarded_update.UpdateRefused, "before publishing anything"):
+                self.apply(staged, accept_guard_changes=True)
+        self.assertEqual(self.installed(), before)
+        self.assertEqual(self.steps(), [])
+        self.assertFalse((self.root / FAILED).exists())
+        self.assertFalse((self.root / INFLIGHT).exists())
+
+    def test_a_kill_during_the_canary_leaves_the_in_flight_record_and_both_steps_refuse(self):
+        staged = self.staged({NEW + HOOK: b"guard v2\n"})
+        during = []
+
+        def run(argv, cwd, timeout):
+            if "canary" in argv:
+                # What a hard kill (no Python handler runs) would leave: the record as it is on disk right now.
+                during.append(json.loads((self.root / INFLIGHT).read_text(encoding="utf-8")))
+                raise KeyboardInterrupt
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        with self.assertRaises(KeyboardInterrupt):
+            self.apply(staged, accept_guard_changes=True, run=run)
+        self.assertEqual(during[0]["operation"], self.journals()[0])
+        record = json.loads((self.root / INFLIGHT).read_text(encoding="utf-8"))
+        self.assertEqual(record["operation"], self.journals()[0])
+        self.assertIn("KeyboardInterrupt", record["interrupted"])
+        self.assertEqual(record["review_sha256"], staged.review_sha256)
+        self.assertEqual((record["from_version"], record["to_version"]), ("4.2.0", "4.3.0"))
+        self.assertIsInstance(record["pid"], int)
+        self.assertFalse((self.root / FAILED).exists())
+        with self.assertRaisesRegex(guarded_update.UpdateRefused, "update-in-flight"):
+            self.staged()
+        with self.assertRaisesRegex(guarded_update.UpdateRefused, "update-in-flight"):
+            self.apply(staged, accept_guard_changes=True)
+
+    def test_the_record_is_written_before_apply_without_an_operation(self):
+        staged = self.staged()
+        seen = []
+        real = installation.apply
+
+        def spy(*args, **kwargs):
+            seen.append(json.loads((self.root / INFLIGHT).read_text(encoding="utf-8")))
+            return real(*args, **kwargs)
+        with mock.patch.object(installation, "apply", side_effect=spy):
+            applied = self.apply(staged)
+        self.assertTrue(applied.ok, applied.report)
+        self.assertIsNone(seen[0]["operation"])
+        self.assertEqual(seen[0]["review_sha256"], staged.review_sha256)
+
+    def test_success_removes_the_record(self):
+        applied = self.apply(self.staged())
+        self.assertTrue(applied.ok, applied.report)
+        self.assertFalse((self.root / INFLIGHT).exists())
+
+    def test_clean_rollback_removes_the_record(self):
+        applied = self.apply(self.staged({NEW + HOOK: b"guard v2\n"}), policy=self.policy(canary="fail-if-v2"),
+                             accept_guard_changes=True)
+        self.assertTrue(applied.rolled_back)
+        self.assertFalse((self.root / FAILED).exists())
+        self.assertFalse((self.root / INFLIGHT).exists())
+
+    def test_double_failure_leaves_the_marker_and_removes_the_record(self):
+        applied = self.apply(self.staged({NEW + HOOK: b"guard v2\n"}), policy=self.policy(canary="fail"),
+                             accept_guard_changes=True)
+        self.assertFalse(applied.ok)
+        self.assertTrue((self.root / FAILED).exists())
+        self.assertFalse((self.root / INFLIGHT).exists())
+
+    def test_a_marker_that_cannot_be_written_keeps_the_record(self):
+        real = guarded_update._write_marker
+
+        def no_marker(root, data, name=guarded_update.FAILED_MARKER):
+            return "OSError: disk full" if name == guarded_update.FAILED_MARKER else real(root, data, name)
+        with mock.patch.object(guarded_update, "_write_marker", side_effect=no_marker):
+            applied = self.apply(self.staged({NEW + HOOK: b"guard v2\n"}), policy=self.policy(canary="fail"),
+                                 accept_guard_changes=True)
+        self.assertIn("COULD NOT WRITE", applied.report)
+        self.assertTrue((self.root / INFLIGHT).exists())
+
+    def test_clear_failed_clears_both(self):
+        for name in (FAILED, INFLIGHT):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"v": 1}')
+        guarded_update.clear_failed(self.root)
+        self.assertFalse((self.root / FAILED).exists())
+        self.assertFalse((self.root / INFLIGHT).exists())
+        state = self.root / ".modding-agent-harness"
+        self.assertEqual(len(list(state.glob("update-failed.cleared-*.json"))), 1)
+        self.assertEqual(len(list(state.glob("update-in-flight.cleared-*.json"))), 1)
+        self.staged()
+
+    def test_the_record_survives_a_later_upgrade_and_does_not_make_a_review_stale(self):
+        record = b'{"v": 1, "operation": null}\n'
+        inventory = lambda files: {"v": 1, "files": {name: sha(data) for name, data in files.items()}}
+
+        def plain(name, shipped):
+            root, source, bundle = (Path(self.tmp.name) / (name + suffix) for suffix in ("-root", "-src", "-rev"))
+            for folder in (root, source):
+                (folder / ".modding-agent-harness").mkdir(parents=True)
+            (root / "owned.txt").write_bytes(b"old")
+            (source / "owned.txt").write_bytes(b"new")
+            files = {"owned.txt": b"new"}
+            if shipped:
+                (source / INFLIGHT).write_bytes(b"shipped")
+                files[INFLIGHT] = b"shipped"
+            return root, source, bundle, files
+        # Retained: a release that ships the name can never replace the user's record.
+        root, source, bundle, files = plain("retained", True)
+        (root / INFLIGHT).write_bytes(record)
+        upgrade.stage_review_bundle(root, source, bundle, inventory(files), inventory({"owned.txt": b"old"}), reserve=0)
+        review = hashlib.sha256((bundle / "complete.json").read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "local settings/notes must be retained"):
+            installation.apply(root, bundle, review, {INFLIGHT: "candidate"}, quiescent=True, reserve=0)
+        self.assertEqual((root / INFLIGHT).read_bytes(), record)
+        installation.apply(root, bundle, review, {INFLIGHT: "keep"}, quiescent=True, reserve=0)
+        self.assertEqual((root / "owned.txt").read_bytes(), b"new")
+        self.assertEqual((root / INFLIGHT).read_bytes(), record)
+        # Not observed: writing the record after staging (as apply_update does) must not make the review stale.
+        root, source, bundle, files = plain("unobserved", False)
+        upgrade.stage_review_bundle(root, source, bundle, inventory(files), inventory({"owned.txt": b"old"}), reserve=0)
+        self.assertNotIn(INFLIGHT, json.loads((bundle / "complete.json").read_text())["observed_local_files"])
+        review = hashlib.sha256((bundle / "complete.json").read_bytes()).hexdigest()
+        (root / INFLIGHT).write_bytes(record)
+        installation.apply(root, bundle, review, quiescent=True, reserve=0)
+        self.assertEqual((root / "owned.txt").read_bytes(), b"new")
+        self.assertEqual((root / INFLIGHT).read_bytes(), record)
 
 
 if __name__ == "__main__":

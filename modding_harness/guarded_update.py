@@ -28,6 +28,9 @@ from pathlib import Path
 from . import installation, release, transport, update_review, upgrade
 
 FAILED_MARKER = ".modding-agent-harness/update-failed.json"
+#: Written before files are replaced and removed only once the outcome is final. Left behind (a kill, an interrupt, a
+#: tool timeout during setup or canary), it means an unverified guard set may be live: fail closed, like the marker.
+IN_FLIGHT = ".modding-agent-harness/update-in-flight.json"
 META = "meta.json"
 MAX_INVENTORY = 1024 * 1024
 
@@ -53,6 +56,18 @@ def _read_json(path):
     """A bounded JSON object, read the way `installation.handle` reads its candidate, previous and render files."""
     with Path(path).open("rb") as stream:
         return transport.load(stream.read(MAX_INVENTORY + 1))
+
+
+def _present(path):
+    return path.exists() or path.is_symlink()
+
+
+def _refuse_in_flight(root):
+    if _present(root / IN_FLIGHT):
+        raise UpdateRefused(
+            "an earlier update was interrupted before its outcome was known and left {}: the install may hold an "
+            "unverified guard set. Read it, run the toolkit's canary or roll back its operation (upgrade-rollback "
+            "OPERATION --quiescent), then clear it (update-clear-failed); nothing was changed".format(IN_FLIGHT))
 
 
 def _discard_earlier_review(work):
@@ -90,6 +105,7 @@ def stage_update(root, profile, policy, *, notes_files=(), http=None, candidate_
     if (root / FAILED_MARKER).exists() or (root / FAILED_MARKER).is_symlink():
         raise UpdateRefused("an earlier update failed and left {}; read it, fix the cause and clear it before "
                             "staging another update".format(FAILED_MARKER))
+    _refuse_in_flight(root)
     try:
         notes = installation.notes_set(notes_files)
         fetched = release.fetch(root, profile, **({} if http is None else {"http": http}))
@@ -130,7 +146,7 @@ SOURCE = "unpacked"    # `release.fetch` unpacks the release beside the bundle u
 _SHA = re.compile(r"[0-9a-f]{64}")
 _OPERATION = re.compile(r"[0-9a-f]{32}")
 _JOURNALS = ".modding-agent-harness/upgrades"
-_OWN_STATE = frozenset((".modding-agent-harness/upgrade.lock", FAILED_MARKER))   # written by the updater itself
+_OWN_STATE = frozenset((".modding-agent-harness/upgrade.lock", FAILED_MARKER, IN_FLIGHT))   # the updater's own files
 
 
 @dataclass(frozen=True)
@@ -228,12 +244,47 @@ def _differences(before, after, verified=()):
             for name in names if before.get(name) != after.get(name)]
 
 
-def _operations(root):
-    folder = root / _JOURNALS
+def _journal(root, operation):
+    return root / ".modding-agent-harness" / "upgrades" / operation
+
+
+def _own_operation(root, exc, review_sha256):
+    """The operation an `UpgradeFailed` from OUR `installation.apply` call names, proved twice: its message carries
+    `journal=<path>:` and that journal's plan.json records our review SHA-256. None when either proof is missing; a
+    folder merely being new is never proof (another updater may have created it while we waited for the lock)."""
+    match = re.search(r"; journal=(.*?[\\/]upgrades[\\/]([0-9a-f]{32})): ", str(exc))
+    if match is None:
+        return None
+    operation = match.group(2)
+    journal = _journal(root, operation)
+    if Path(match.group(1)) != journal:
+        return None
     try:
-        return {path.name for path in folder.iterdir() if _OPERATION.fullmatch(path.name)} if folder.is_dir() else set()
+        plan = _read_json(journal / "plan.json")
+    except (OSError, ValueError):
+        return None
+    return operation if plan.get("review_sha256") == review_sha256 and plan.get("root") == str(root) else None
+
+
+def _published_any(root, operation):
+    """Did the operation record any publication intent? An unreadable journal counts as yes."""
+    try:
+        return any(_journal(root, operation).glob("*-intent.json"))
     except OSError:
-        return set()
+        return True
+
+
+def _record(root, data):
+    """Write the in-flight record. Returns None, or the reason it could not be written."""
+    return _write_marker(root, data, IN_FLIGHT)
+
+
+def _settle(root):
+    """The outcome is final: the in-flight record goes (it is this run's own scratch). Never raises."""
+    try:
+        (root / IN_FLIGHT).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _read_review(bundle, review_sha256):
@@ -247,10 +298,10 @@ def _read_review(bundle, review_sha256):
     return review
 
 
-def _write_marker(root, marker):
-    """Write the fail-closed marker. Returns None, or the reason it could not be written."""
+def _write_marker(root, marker, name=FAILED_MARKER):
+    """Write the fail-closed marker (or another of the updater's own records). Returns None, or why it failed."""
     try:
-        path = root / FAILED_MARKER
+        path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         _write_meta(path, marker)
         return None
@@ -259,13 +310,14 @@ def _write_marker(root, marker):
 
 
 def clear_failed(root):
-    """The user has read the failure and fixed its cause: set the marker aside (renamed, kept as evidence, never
-    deleted) so staging works again. Nothing to clear is not an error."""
-    path = Path(root).resolve() / FAILED_MARKER
-    if not (path.exists() or path.is_symlink()):
-        return None
+    """The user has read the failure and fixed its cause: set the failed marker and the in-flight record aside
+    (renamed, kept as evidence, never deleted) so staging works again. Nothing to clear is not an error."""
+    root = Path(root).resolve()
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    os.replace(path, path.with_name("update-failed.cleared-{}-{}.json".format(stamp, uuid.uuid4().hex[:8])))
+    for name in (FAILED_MARKER, IN_FLIGHT):
+        path = root / name
+        if _present(path):
+            os.replace(path, path.with_name("{}.cleared-{}-{}.json".format(Path(name).stem, stamp, uuid.uuid4().hex[:8])))
     return None
 
 
@@ -288,6 +340,7 @@ def apply_update(root, policy, bundle, review_sha256, choices, *, accept_guard_c
     if (root / FAILED_MARKER).exists() or (root / FAILED_MARKER).is_symlink():
         raise _refused("an earlier update failed and left {}; read it, fix the cause and clear it first"
                        .format(FAILED_MARKER))
+    _refuse_in_flight(root)
     if not isinstance(review_sha256, str) or _SHA.fullmatch(review_sha256) is None:
         raise _refused("the review SHA-256 must be 64 lowercase hex digits")
     try:
@@ -338,34 +391,61 @@ def apply_update(root, policy, bundle, review_sha256, choices, *, accept_guard_c
         raise _refused("every collision and merged settings file needs the user's explicit choice; missing: "
                        + ", ".join(missing))
 
-    earlier = _operations(root)
     before = _snapshot(root)
+    flight = {"v": 1, "operation": None, "review_sha256": review_sha256, "from_version": from_version,
+              "to_version": to_version, "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "pid": os.getpid()}
+    reason = _record(root, flight)
+    if reason is not None:
+        _settle(root)
+        raise _refused("could not write {} before applying: {}".format(IN_FLIGHT, reason))
+    # From here until the outcome is final, the record stays on disk. It is removed only on a final outcome (never in
+    # a `finally`), so a kill, an interrupt or a tool timeout leaves it behind and the next stage or apply refuses.
     try:
-        result = installation.apply(root, bundle, review_sha256, choices, quiescent=True,
-                                    candidate_validator=candidate_validator, notes_files=notes_files)
-    except Exception as exc:
-        started = sorted(_operations(root) - earlier)
-        published = bool(started) and any((root / _JOURNALS / started[0]).glob("*-intent.json"))
-        if len(started) == 1 and published:
+        try:
+            result = installation.apply(root, bundle, review_sha256, choices, quiescent=True,
+                                        candidate_validator=candidate_validator, notes_files=notes_files)
+        except installation.UpgradeFailed as exc:
+            # Raised only once OUR journal exists. Identify it positively; a new folder alone may be another updater's.
+            operation = _own_operation(root, exc, review_sha256)
+            if operation is None:
+                return _unidentified(root, exc, review, choices, from_version, to_version)
+            flight["operation"] = operation
+            _record(root, flight)
+            if not _published_any(root, operation):
+                raise _refused("apply failed before publishing anything (journal {}): {}".format(operation, exc)) \
+                    from exc
             # Files may already be replaced: recover exactly as after a failed step.
             failed = {"label": "apply", "argv": [], "ok": False, "status": "failed: {}".format(exc),
                       "stdout": [], "stderr": []}
-            return _recover(root, old_canary, runner, notes_files, started[0], [failed], failed, before,
+            return _recover(root, old_canary, runner, notes_files, operation, [failed], failed, before,
                             review, choices, from_version, to_version)
-        if isinstance(exc, TimeoutError):
+        except TimeoutError as exc:
+            # A bare TimeoutError: every error after the journal exists is wrapped in UpgradeFailed, so this is the
+            # lock wait (or the deadline) before anything was written.
             raise _refused("the upgrade lock .modding-agent-harness/upgrade.lock is held by another updater, or apply "
                            "ran out of time before changing anything: {}".format(exc)) from exc
-        if isinstance(exc, (OSError, ValueError)):
+        except (OSError, ValueError) as exc:
             raise _refused("apply refused: {}".format(exc)) from exc
+        operation = result["operation"]
+        flight["operation"] = operation
+        _record(root, flight)
+        steps = []
+        for label, argv in planned:
+            step = _step(label, argv, root, runner)
+            steps.append(step)
+            if not step["ok"]:
+                return _recover(root, old_canary, runner, notes_files, operation, steps, step, before, review,
+                                choices, from_version, to_version)
+        _settle(root)
+    except UpdateRefused:
+        _settle(root)             # a clean refusal is a final outcome
         raise
-    operation = result["operation"]
-    steps = []
-    for label, argv in planned:
-        step = _step(label, argv, root, runner)
-        steps.append(step)
-        if not step["ok"]:
-            return _recover(root, old_canary, runner, notes_files, operation, steps, step, before, review,
-                            choices, from_version, to_version)
+    except BaseException as exc:
+        # Outcome unknown (an interrupt, or an error nobody expected): keep the record, note what happened, fail closed.
+        flight["interrupted"] = "{}: {}".format(type(exc).__name__, exc)
+        _record(root, flight)
+        raise
     lines = ["Update {} -> {}: APPLIED, setup and canary passed.".format(from_version, to_version),
              "operation: {} (undo with upgrade-rollback {} --quiescent)".format(operation, operation)]
     lines += _common(review, choices, steps, result.get("published", []))
@@ -373,6 +453,27 @@ def apply_update(root, policy, bundle, review_sha256, choices, *, accept_guard_c
               "  whatever setup generated or deployed is outside the rollback journal; a later upgrade-rollback of this",
               "  operation restores the installed files only.", ""]
     return Applied(True, operation, False, "\n".join(lines) + "\n")
+
+
+def _unidentified(root, exc, review, choices, from_version, to_version):
+    """`installation.apply` failed after creating a journal, but the failure names no journal we can prove is ours.
+    Some files may be replaced and nothing can be rolled back safely: fail closed."""
+    marker = {"v": 1, "from_version": from_version, "to_version": to_version, "operation": None,
+              "first_failure": "apply", "failed_step": "apply", "error": "{}: {}".format(type(exc).__name__, exc),
+              "output_tail": "", "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    reason = _write_marker(root, marker)
+    if reason is None:
+        _settle(root)
+    lines = ["Update {} -> {}: FAILED at apply ({}); NOT rolled back.".format(from_version, to_version, exc),
+             "The failure names no upgrade journal that records this review, so this updater cannot tell which files",
+             "it replaced and rolls nothing back. Some files may be replaced.", "",
+             "FAIL CLOSED: the guards may be broken or missing."]
+    lines.append("Wrote {}; staging refuses until the user reads it, fixes the cause and clears it.".format(
+        FAILED_MARKER) if reason is None else
+        "COULD NOT WRITE {} ({}): tell the user now; do not trust the guards.".format(FAILED_MARKER, reason))
+    lines += ["", "Not restored by rollback:", "  unknown: look in .modding-agent-harness/upgrades/ for the journal.", ""]
+    lines += _common(review, choices, [], [])
+    return Applied(False, "", False, "\n".join(lines) + "\n")
 
 
 def _common(review, choices, steps, published):
@@ -421,8 +522,12 @@ def _recover(root, old_canary, runner, notes_files, operation, steps, failed, be
     if restored is not None:
         lines.append("rollback restored {} file(s), set {} new file(s) aside in {}".format(
             len(restored.get("restored", [])), len(restored.get("retained_new_files", [])), restored.get("journal")))
-    if problem is not None:
+    if problem is None:
+        _settle(root)             # rolled back cleanly and the old canary passes: final
+    else:
         reason = _write_marker(root, marker)
+        if reason is None:
+            _settle(root)         # the marker now carries the fail-closed state
         lines += ["", "FAIL CLOSED: {}. The guards may be broken or missing.".format(problem)]
         lines.append("Wrote {}; staging refuses until the user reads it, fixes the cause and clears it.".format(
             FAILED_MARKER) if reason is None else
