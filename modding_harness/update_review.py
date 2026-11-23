@@ -28,6 +28,7 @@ MAX_REVIEW = 16 * 1024 * 1024
 SHORT = 12
 _SHA = re.compile(r"[0-9a-f]{64}")
 _QUIET = ("unchanged", "absent_retired")
+KEEPS_INSTALLED = ("preserve_collision", "preserve_local")   # actions whose default outcome keeps the installed bytes
 
 
 @dataclass(frozen=True)
@@ -50,8 +51,11 @@ def _changes_bytes(row):
     candidate, installed = row.get("candidate_sha256"), row.get("installed_sha256")
     if candidate == installed:
         return False
-    # The new release did not touch it: keeping the user's copy is lossless, not a guard change.
-    return not (candidate is not None and candidate == row.get("previous_sha256"))
+    # The new release did not touch it and the default outcome keeps the user's installed bytes: that is lossless, not
+    # a guard change. A `create` row (file deleted locally; apply writes it back) is a change even when the release
+    # did not touch the file.
+    return not (row.get("action") in KEEPS_INSTALLED and candidate is not None
+                and candidate == row.get("previous_sha256"))
 
 
 def classify(rows, policy):

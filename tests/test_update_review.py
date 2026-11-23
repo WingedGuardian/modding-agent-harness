@@ -80,6 +80,27 @@ class ClassifyTests(unittest.TestCase):
             self.assertIn("unchanged upstream, keep is lossless", text)
             self.assertNotIn("@@", text)
 
+    def test_deleted_guard_hook_that_apply_would_recreate_is_a_guard_change(self):
+        # The user removed a hook both releases ship: preview emits `create` (candidate == previous, installed absent)
+        # and apply writes it back, so the exemption for "unchanged upstream" must not cover it.
+        with tempfile.TemporaryDirectory() as folder:
+            fx = Fixture(folder)
+            fx.row(HOOK, "create", previous=b"print('guard')\n", candidate=b"print('guard')\n")
+            guard, other = classify(fx.rows, policy())
+            self.assertEqual([r["path"] for r in guard], [HOOK])
+            self.assertEqual(other, [])
+            (text, accept), _ = fx.render()
+            self.assertTrue(accept)
+            self.assertIn("+print('guard')", text)
+            self.assertIn("@@", text)
+
+    def test_kept_local_guard_file_unchanged_upstream_is_not_a_guard_change(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fx = Fixture(folder)
+            fx.row(HOOK, "preserve_local", installed=b"mine\n", previous=b"old\n", candidate=b"old\n")
+            guard, _ = classify(fx.rows, policy())
+            self.assertEqual(guard, [])
+
     def test_guard_row_needs_different_bytes_not_just_a_matching_path(self):
         with tempfile.TemporaryDirectory() as folder:
             fx = Fixture(folder)
