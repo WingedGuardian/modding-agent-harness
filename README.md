@@ -228,7 +228,11 @@ neither. A toolkit adds `update_review.UpdatePolicy(guard_paths, policy_files, s
 its `ReleaseProfile`, and wires `guarded_update.add_arguments` / `handle` / `exit_code` / `session_note` next to
 `release.add_arguments`. It also supplies a candidate preparer and validator, so hook files are rendered for the install
 before review (the apply validator refuses unrendered hook files). The profile, the policy and those hooks are code in
-the INSTALLED toolkit; the downloaded release cannot choose its own repository, setup or canary.
+the INSTALLED toolkit; the downloaded release cannot choose its own repository, setup or canary. `handle` takes them as
+keywords: `candidate_preparer`, `generated_paths` (stage) and `candidate_validator`, `new_policy`, `notes_files` (apply).
+When a release changes one of the policy files, the toolkit must also pass `new_policy` (the candidate's setup and
+canary, so the new and the old canary both run); without it `update-apply` refuses, so the first release that edits a
+policy file stops there until the toolkit supplies it.
 
 Two steps, and the second needs the user:
 

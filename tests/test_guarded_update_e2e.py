@@ -359,6 +359,89 @@ class SessionNoteTests(unittest.TestCase):
         self.assertIsInstance(guarded_update.session_note(None), (str, type(None)))
 
 
+class HookPassThroughTests(Base):
+    """`handle` forwards the toolkit's own hooks (`http`, `candidate_preparer`, `generated_paths`, `notes_files`,
+    `candidate_validator`, `new_policy`) and nothing else supplies them. Each is checked by a spy that must be reached,
+    and the forwarding itself by a wrapper around the call the argument is for."""
+
+    def test_stage_passes_the_toolkit_hooks_through(self):
+        config = Path(self.tmp.name) / "render.json"
+        config.write_text('{"v": 1, "root": "destination"}')
+        policy = UpdatePolicy(guard_paths=(".claude/hooks/*",), policy_files=(), setup=("x",), canary=("x",),
+                              render_config=lambda root: config)
+        gh, seen = self.github(), []
+
+        def preparer(installed, staged, files, data):
+            seen.append((Path(installed), dict(data)))
+            return {}
+        real = guarded_update.stage_update
+        with mock.patch.object(guarded_update, "stage_update", wraps=real) as spy:
+            result = self.run_command("update-stage", policy=policy, http=gh, notes_files=("NOTES.md",),
+                                      candidate_preparer=preparer, generated_paths=(".codex/hooks.json",))
+        kwargs = spy.call_args.kwargs
+        self.assertIs(kwargs["candidate_preparer"], preparer)
+        self.assertEqual(tuple(kwargs["generated_paths"]), (".codex/hooks.json",))
+        self.assertEqual(tuple(kwargs["notes_files"]), ("NOTES.md",))
+        self.assertIs(kwargs["http"], gh)
+        self.assertEqual(seen, [(self.root.resolve(), {"v": 1, "root": "destination"})])   # the spy was reached
+        self.assertTrue(gh.calls)                                                         # the fake http was used
+        self.assertEqual(guarded_update.exit_code(result), 0)
+        complete = json.loads((Path(result["bundle"]) / "complete.json").read_text(encoding="utf-8"))
+        self.assertIn("generated_files", complete)                                        # a renderer ran
+
+    def test_apply_passes_the_toolkit_hooks_through(self):
+        # The release adds a policy file, so apply needs the candidate's own policy (`new_policy`).
+        gh = self.github()
+        gh.body = make_zip(extra={NEW + HOOK: b"guard v1\n", NEW + "tools/update_policy.json": b'{"canary": "B"}\n'})
+        gh.digest = "sha256:" + hashlib.sha256(gh.body).hexdigest()
+        old = UpdatePolicy(guard_paths=(".claude/hooks/*",), policy_files=("tools/update_policy.json",),
+                           setup=(sys.executable, str(self.step), "pass"),
+                           canary=(sys.executable, str(self.step), "pass"), render_config=lambda root: root / "x.json")
+        (self.root / "NOTES.md").write_bytes(b"toolkit notes the user keeps\n")
+        staged = self.run_command("update-stage", policy=old, http=gh, notes_files=("NOTES.md",))
+        self.assertIs(staged["requires_guard_accept"], True)
+        self.choices.write_text("{}", encoding="utf-8")                                  # this release ships no notes
+        argv = apply_argv(staged["review"], self.choices)
+        marker = Path(self.tmp.name) / "new-policy-ran"
+        new = UpdatePolicy(guard_paths=old.guard_paths, policy_files=old.policy_files,
+                           setup=(sys.executable, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('x')",
+                                  str(marker)),
+                           canary=(sys.executable, str(self.step), "pass"), render_config=old.render_config)
+        validated = []
+        validator = lambda root, changes: validated.append((Path(root), [row["path"] for row in changes]))
+        args = parser().parse_args(argv)
+        real_apply, real_install = guarded_update.apply_update, installation.apply
+        with mock.patch.object(guarded_update, "apply_update", wraps=real_apply) as spy,                 mock.patch.object(installation, "apply", wraps=real_install) as inner:
+            result = guarded_update.handle(args, self.root, profile(), old, notes_files=("NOTES.md",),
+                                           new_policy=new, candidate_validator=validator)
+        self.assertIs(result["ok"], True, result["report"])
+        kwargs = spy.call_args.kwargs
+        self.assertIs(kwargs["new_policy"], new)
+        self.assertIs(kwargs["candidate_validator"], validator)
+        self.assertEqual(tuple(kwargs["notes_files"]), ("NOTES.md",))
+        self.assertIs(inner.call_args.kwargs["candidate_validator"], validator)
+        self.assertIn("NOTES.md", inner.call_args.kwargs["notes_files"])
+        self.assertTrue(marker.exists())                                                  # the candidate's setup ran
+        self.assertEqual(len(validated), 1)                                               # the validator was reached
+        self.assertEqual(validated[0][0], self.root.resolve())
+        self.assertIn("tools/update_policy.json", validated[0][1])
+
+    def test_a_changed_policy_file_without_new_policy_is_a_refusal_through_handle(self):
+        gh = self.github()
+        gh.body = make_zip(extra={NEW + HOOK: b"guard v1\n", NEW + "tools/update_policy.json": b'{"canary": "B"}\n'})
+        gh.digest = "sha256:" + hashlib.sha256(gh.body).hexdigest()
+        old = UpdatePolicy(guard_paths=(".claude/hooks/*",), policy_files=("tools/update_policy.json",),
+                           setup=(sys.executable, str(self.step), "pass"),
+                           canary=(sys.executable, str(self.step), "pass"), render_config=lambda root: root / "x.json")
+        staged = self.run_command("update-stage", policy=old, http=gh)
+        self.choices.write_text("{}", encoding="utf-8")
+        before = self.installed()
+        with self.assertRaisesRegex(guarded_update.UpdateRefused, "new_policy") as caught:
+            self.run_command(*apply_argv(staged["review"], self.choices), policy=old)
+        self.assertEqual(guarded_update.exit_code(caught.exception), 2)
+        self.assertEqual(self.installed(), before)
+
+
 class VendoringTests(unittest.TestCase):
     def test_new_modules_are_vendored(self):
         """`scripts/vendor.py` takes every .py under modding_harness from the committed tree (no module list to forget)
