@@ -9,6 +9,7 @@ import json
 import stat
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -42,13 +43,15 @@ def make_zip(version="4.3.0", commit=COMMIT, extra=None, root_name=None, info_ve
 
 class FakeGitHub:
     def __init__(self, version="4.3.0", body=None, digest=None, draft=False, prerelease=False, commit=COMMIT,
-                 asset_name=None, url=None, fail=None):
+                 asset_name=None, url=None, fail=None, previous=True):
         self.body = make_zip(version) if body is None else body
         self.version, self.commit, self.fail = version, commit, fail
         self.digest = "sha256:" + hashlib.sha256(self.body).hexdigest() if digest is None else digest
         self.name = asset_name or "toolkit-{}.zip".format(version)
         self.url = url or "https://github.com/{}/releases/download/v{}/{}".format(REPO, version, self.name)
         self.draft, self.prerelease, self.calls = draft, prerelease, []
+        self.previous = make_zip("4.2.0", commit="c" * 40) if previous is True else previous
+        self.previous_url = "https://github.com/{}/releases/download/v4.2.0/toolkit-4.2.0.zip".format(REPO)
 
     def __call__(self, url, limit=release.MAX_META, accept=None, stream_to=None):
         self.calls.append(url)
@@ -60,9 +63,17 @@ class FakeGitHub:
                                            "browser_download_url": self.url}]}).encode()
         if "/commits/" in url:
             return json.dumps({"sha": self.commit}).encode()
-        if url == self.url:
-            stream_to.write(self.body)
-            return hashlib.sha256(self.body).hexdigest(), len(self.body)
+        if "/releases/tags/" in url:
+            if self.previous is None:
+                raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+            version = url.rsplit("/v", 1)[1]
+            return json.dumps({"tag_name": "v" + version, "assets": [
+                {"name": "toolkit-{}.zip".format(version), "digest": "sha256:" + hashlib.sha256(self.previous).hexdigest(),
+                 "browser_download_url": self.previous_url}]}).encode()
+        if url == self.url or url == self.previous_url:
+            body = self.body if url == self.url else self.previous
+            stream_to.write(body)
+            return hashlib.sha256(body).hexdigest(), len(body)
         raise AssertionError("unexpected URL " + url)
 
 
@@ -166,6 +177,20 @@ class FetchTests(Base):
         self.assertEqual(set(candidate["files"]), {"BUILD-INFO", "setup.sh", "tools/a.py"})
         self.assertEqual(candidate["files"]["setup.sh"], hashlib.sha256(b"echo setup\n").hexdigest())
         self.assertTrue((Path(out["source"]) / "tools/a.py").is_file())
+
+    def test_the_installed_release_s_own_inventory_becomes_previous(self):
+        out = release.fetch(self.root, profile(), FakeGitHub())
+        previous = json.loads(Path(out["previous"]).read_text())
+        self.assertEqual(previous["files"]["setup.sh"], hashlib.sha256(b"echo setup\n").hexdigest())
+        self.assertIn("BUILD-INFO", previous["files"])
+        self.assertEqual(list(Path(out["candidate"]).parent.glob("previous-*.part")), [])   # never left behind
+
+    def test_no_installed_release_still_fetches_without_previous(self):
+        for gh in (FakeGitHub(previous=None), FakeGitHub(previous=b"not the published bytes")):
+            out = release.fetch(self.root, profile(), gh)
+            self.assertIsNone(out["previous"])
+            self.assertTrue(out["previous_note"])
+            self.assertTrue(Path(out["candidate"]).is_file())
 
     def test_a_digest_mismatch_refuses_and_keeps_no_zip(self):
         gh = FakeGitHub(digest="sha256:" + "0" * 64)

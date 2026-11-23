@@ -298,9 +298,44 @@ def fetch(root, profile, http=http_get, environ=None):
     for path in sorted(p for p in source.rglob("*") if p.is_file()):
         candidate["files"][path.relative_to(source).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
     (work / "candidate.json").write_bytes((json.dumps(candidate, sort_keys=True) + "\n").encode("utf-8"))
+    previous, why = _previous(profile, installed, http, work)
     return {"version": found["version"], "installed": installed, "tag": found["tag"], "commit": commit,
             "zip": str(zip_path), "sha256": sha, "source": str(source), "candidate": str(work / "candidate.json"),
-            "bundle": str(work / "bundle"), "files": len(candidate["files"]), "installed_changed": False}
+            "previous": previous, "previous_note": why, "bundle": str(work / "bundle"),
+            "files": len(candidate["files"]), "installed_changed": False}
+
+
+def _previous(profile, installed, http, work):
+    """What the INSTALLED release shipped, as an inventory (`upgrade-preview --previous`): the installed version's
+    own release zip, verified by its GitHub digest and hashed member by member in memory (never unpacked). Without
+    it every shipped file the user never touched would be shown as a possible change of theirs. Optional: any
+    problem returns (None, why) and the review simply shows more files to choose on."""
+    try:
+        data = _json(http, "{}/repos/{}/releases/tags/v{}".format(API, profile.repo, installed))
+        name = profile.asset.format(version=".".join(map(str, parse_version(installed))))
+        asset = next((a for a in data.get("assets") or () if isinstance(a, dict) and a.get("name") == name), None)
+        digest = str((asset or {}).get("digest") or "")
+        url = str((asset or {}).get("browser_download_url") or "")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) or not url.startswith(
+                "https://github.com/{}/releases/download/".format(profile.repo)):
+            return None, "the installed release {} has no verifiable asset {}".format(installed, name)
+        part = work / ("previous-" + name + ".part")
+        try:
+            with part.open("w+b") as stream:
+                sha, _ = http(url, limit=MAX_ZIP, accept="application/octet-stream", stream_to=stream)
+                if sha != digest[7:]:
+                    return None, "the installed release's zip does not match its published digest"
+                stream.seek(0)
+                with zipfile.ZipFile(stream) as archive:
+                    _, members = _safe_members(archive)
+                    files = {rel: hashlib.sha256(archive.read(info)).hexdigest() for rel, info in members.items()}
+        finally:
+            part.unlink(missing_ok=True)
+        path = work / "previous.json"
+        path.write_bytes((json.dumps({"v": 1, "files": files}, sort_keys=True) + "\n").encode("utf-8"))
+        return str(path), ""
+    except Exception as exc:                    # optional evidence: never the reason an update fails
+        return None, "the installed release's inventory is unavailable ({})".format(type(exc).__name__)
 
 
 def add_arguments(subparsers):

@@ -210,7 +210,9 @@ name with `{version}` in it, how the note names it, and a function that reads th
   asset (no digest, no download); every entry sits under one folder with no link, absolute, drive or `..` name and no
   case-folded duplicate (the upgrader's own inventory rules); and the unpacked `BUILD-INFO` names the release's
   version and the commit its tag points at. It prints the `--source` and `--candidate` paths for `upgrade-preview` and
-  `upgrade-stage`. Nothing installed changes.
+  `upgrade-stage`, and `--previous`: the installed release's own inventory, from that release's zip (digest-checked,
+  hashed in memory, never unpacked), so files the user never touched are not shown as their changes. Without it the
+  review just shows more files to choose on. Nothing installed changes.
 
 Checking is on by default. `{"v": 1, "check": false}` in `.modding-agent-harness/updates.json` (a protected local
 file an upgrade never replaces) or `MODDING_HARNESS_UPDATE_CHECK=off` turns it off. The setting is deliberately not in
