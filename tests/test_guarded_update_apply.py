@@ -783,6 +783,20 @@ class ConcurrencyAndInFlightTests(ApplyBase):
         self.assertTrue(applied.ok, applied.report)
         self.assertEqual(json.loads((self.root / INFLIGHT).read_text(encoding="utf-8"))["nonce"], "theirs")
 
+    def test_a_rewrite_never_overwrites_a_record_that_is_no_longer_ours(self):
+        staged = self.staged()
+        real = installation.apply
+
+        def apply(*args, **kwargs):
+            result = real(*args, **kwargs)
+            self.put_record({"v": 1, "nonce": "theirs", "operation": None})      # replaced before our rewrite
+            return result
+        with mock.patch.object(installation, "apply", side_effect=apply):
+            applied = self.apply(staged)
+        self.assertTrue(applied.ok, applied.report)
+        record = json.loads((self.root / INFLIGHT).read_text(encoding="utf-8"))
+        self.assertEqual((record["nonce"], record["operation"]), ("theirs", None))   # not rewritten, not removed
+
     def test_record_rewrites_keep_the_nonce(self):
         staged = self.staged()
         seen = []
