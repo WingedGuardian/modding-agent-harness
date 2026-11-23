@@ -232,29 +232,40 @@ the INSTALLED toolkit; the downloaded release cannot choose its own repository, 
 keywords: `candidate_preparer`, `generated_paths` (stage) and `candidate_validator`, `new_policy`, `notes_files` (apply).
 When a release changes one of the policy files, the toolkit must also pass `new_policy` (the candidate's setup and
 canary, so the new and the old canary both run); without it `update-apply` refuses, so the first release that edits a
-policy file stops there until the toolkit supplies it.
+policy file stops there until the toolkit supplies it. `UpdatePolicy` refuses an empty `guard_paths` and any guard glob
+or policy file that is not posix-relative (a backslash, a leading `/`, a drive or `..` would silently match nothing); the
+review prints how many paths the guard globs matched and a WARNING for a glob that matched nothing in that release.
 
 Two steps, and the second needs the user:
 
 1. `update-stage` fetches the newest release and prints a review: guard, hook, settings and policy-file changes as
-   unified diffs, everything else as a list, and the exact `update-apply` command. It installs and authorizes nothing.
-2. After the user says go, run that command: `update-apply --bundle DIR --review-sha256 SHA --choices FILE
-   [--accept-guard-changes] --quiescent`. If the review changes guard code, a policy file or hook settings, apply also
-   refuses without `--accept-guard-changes`: the user's SEPARATE go for those changes. Every collision needs a choice
-   (`keep`, `candidate`, `merged_settings`) in the choices file.
+   unified diffs, everything else as a list, and the exact `update-apply` command (posix paths, quoted for a POSIX
+   shell). It installs and authorizes nothing. Guard files the user changed locally and the release did not touch are
+   shown with their diff under "Only if you choose `candidate`".
+2. After the user says go, the agent writes the choices file the review names (`choices.json` beside the bundle) and
+   runs that command: `update-apply --bundle DIR --review-sha256 SHA --choices FILE [--accept-guard-changes]
+   --quiescent`. If the review changes guard code, a policy file or hook settings, apply also refuses without
+   `--accept-guard-changes`: the user's SEPARATE go for those changes. Every collision needs a choice (`keep`,
+   `candidate`, `merged_settings`) in the choices file. Choosing anything but `keep` for a file under "Only if you
+   choose `candidate`" needs the same flag, and for a policy file also `new_policy` and both canaries.
 
 Apply runs the toolkit's setup, then its canary (and the old canary too when a policy file changed), each an argv with no
-shell, timeout 600 s. A nonzero exit, a timeout or a missing executable fails the step. A failure rolls the operation
-back automatically and runs the old canary on the restored install. Exit codes (`exit_code`): 0 ok, 1 the update did
+shell, timeout 600 s; on a timeout the step's whole process tree is killed (`taskkill /T` on Windows, its process group
+elsewhere), and output goes to temporary files, so a leftover grandchild cannot hold the wait open. A nonzero exit, a
+timeout or a missing executable fails the step. A failure rolls the operation back automatically, re-runs the installed
+setup on the restored files (so what setup deploys outside the install, a live guard copy for example, comes from the
+restored toolkit again) and then runs the old canary. If that setup or that canary fails, the update fails closed. Exit codes (`exit_code`): 0 ok, 1 the update did
 not succeed (rolled back, or failed closed), 2 a refusal before anything changed.
 
 - Run `update-apply` in the BACKGROUND: setup and canary may each take 600 s, and an agent's foreground command is
   killed at 10 minutes.
 - Two files in `.modding-agent-harness/` fail closed; `session_note(root)` prints one line while either exists, and
   `update-stage` and `update-apply` refuse. `update-failed.json`: a rollback or the old canary failed afterwards, so the
-  guards may be broken. `update-in-flight.json`: an apply started and never reached a final outcome (a kill, an
-  interrupt), so an unverified guard set may be live. The user reads it, fixes the cause (roll back the named operation
-  with `upgrade-rollback`, or run the canary), then `update-clear-failed` sets both aside, renamed and kept.
+  guards may be broken. `update-in-flight.json`: an apply is in progress or was interrupted (it names its pid and
+  start time, and its operation or the journal holding its review), so an unverified guard set may be live. The user
+  reads it, fixes the cause (roll back the named operation with `upgrade-rollback`, or run the canary), then
+  `update-clear-failed` sets both aside, renamed and kept. It refuses while the recorded process is still alive or
+  cannot be checked; `update-clear-failed --force` overrides that once the user is sure the apply has ended.
 - A plain core `upgrade-apply` BYPASSES these markers and the canary: only the `update-*` commands honour them.
 - There is no active-session registry, so the caller asserts `--quiescent` (host and editor writers stopped); the flag
   stops nothing. A running agent may keep the hooks it loaded until it restarts.
