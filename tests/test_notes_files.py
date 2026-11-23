@@ -92,6 +92,28 @@ class NotesFilesTests(unittest.TestCase):
             self.assertEqual((root / "owned.txt").read_bytes(), b"new")
             self.assertEqual((root / name).read_bytes(), b"rules v2, typed during the review")
 
+    def test_the_update_check_setting_is_never_replaced_by_an_upgrade(self):
+        """`.modding-agent-harness/updates.json` holds a user's "do not check for updates": an update must keep it."""
+        with tempfile.TemporaryDirectory() as folder:
+            name = ".modding-agent-harness/updates.json"
+            root, bundle, sha = self.stage(Path(folder), {name: b'{"v": 1, "check": false}'}, {name: b"shipped"})
+            with self.assertRaisesRegex(ValueError, "local settings/notes must be retained"):
+                installation.apply(root, bundle, sha, {name: "candidate"}, quiescent=True, reserve=0)
+            self.assertEqual((root / name).read_bytes(), b'{"v": 1, "check": false}')
+
+    def test_the_update_check_setting_changed_during_a_review_is_kept_and_the_review_redone(self):
+        """A settings file (unlike a notes file) that changes during a review makes that review stale, as config.json
+        does: the upgrade refuses whole, the user's new setting is kept, nothing installed changes."""
+        with tempfile.TemporaryDirectory() as folder:
+            name = ".modding-agent-harness/updates.json"
+            root, bundle, sha = self.stage(Path(folder), {"owned.txt": b"old", name: b'{"v": 1}'},
+                                           {"owned.txt": b"new"}, previous={"owned.txt": b"old"})
+            (root / name).write_bytes(b'{"v": 1, "check": false}')
+            with self.assertRaisesRegex(ValueError, "changed since review: " + re.escape(name)):
+                installation.apply(root, bundle, sha, quiescent=True, reserve=0)
+            self.assertEqual((root / "owned.txt").read_bytes(), b"old")
+            self.assertEqual((root / name).read_bytes(), b'{"v": 1, "check": false}')
+
     def test_bad_notes_names_are_refused(self):
         with tempfile.TemporaryDirectory() as folder:
             root, bundle, sha = self.stage(Path(folder), {"owned.txt": b"old"}, {"owned.txt": b"new"})
