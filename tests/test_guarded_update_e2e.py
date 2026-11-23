@@ -114,11 +114,17 @@ class Base(unittest.TestCase):
 
 
 def apply_argv(text, choices):
-    """Argv of the `update-apply ...` line printed under 'run exactly:' in a review text."""
+    """Argv of the `update-apply ...` line printed under 'run exactly:' in a review text, split the way bash splits it.
+    The review names a real choices path; the agent writes the user's choices there first, as this does."""
     lines = text.splitlines()
     command = next(lines[i + 1] for i, line in enumerate(lines) if line.strip().endswith("run exactly:"))
     argv = shlex.split(command.strip())
-    return [str(choices) if part == "<file>" else part for part in argv]
+    printed = Path(argv[argv.index("--choices") + 1])
+    if Path(choices).exists():
+        printed.write_bytes(Path(choices).read_bytes())
+    elif printed.exists():
+        printed.unlink()
+    return argv
 
 
 class CommandLineTests(Base):
@@ -138,7 +144,7 @@ class CommandLineTests(Base):
                 self.assertEqual(args.command, "update-apply")
                 self.assertEqual(args.bundle, Path(staged["bundle"]))
                 self.assertEqual(args.review_sha256, staged["review_sha256"])
-                self.assertEqual(args.choices, self.choices)
+                self.assertEqual(args.choices, Path(staged["bundle"]).parent / "choices.json")
                 self.assertIs(args.accept_guard_changes, flagged)
                 self.assertIs(args.quiescent, True)
 
@@ -285,7 +291,11 @@ class EndToEndTests(Base):
         with self.assertRaisesRegex(guarded_update.UpdateRefused, "update-in-flight") as caught:
             self.stage(self.github(b"guard v3\n"))
         self.assertEqual(guarded_update.exit_code(caught.exception), 2)
-        cleared = self.run_command("update-clear-failed")
+        # The record names this (still running) test process: clearing it needs --force.
+        with self.assertRaisesRegex(guarded_update.UpdateRefused, "still running") as refused:
+            self.run_command("update-clear-failed")
+        self.assertEqual(guarded_update.exit_code(refused.exception), 2)
+        cleared = self.run_command("update-clear-failed", "--force")
         self.assertEqual(guarded_update.exit_code(cleared), 0)
         self.assertEqual(cleared["cleared"], [INFLIGHT])
         self.assertIsNone(guarded_update.session_note(self.root))

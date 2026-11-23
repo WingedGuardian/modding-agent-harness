@@ -8,13 +8,15 @@ tests' own (`tests/test_guarded_update_stage.py`, through the `http` seam of `te
 import contextlib
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from unittest import mock
 
-from modding_harness import guarded_update, installation, upgrade
+from modding_harness import guarded_update, installation, update_review, upgrade
 from modding_harness.locking import exclusive
 from modding_harness.update_review import UpdatePolicy
 from test_guarded_update_stage import FAILED, HOOK, NEW, OLD, POLICY_FILE, Base, sha
@@ -33,9 +35,14 @@ STEP = textwrap.dedent("""\
         sys.exit(0)
     if rule == "fail-if-v2":                # the new hook is broken: fail only while it is installed
         sys.exit(3 if Path(".claude/hooks/guard.py").read_bytes() == b"guard v2\\n" else 0)
+    if rule == "fail-if-v1":                # the restored (old) state makes this step fail
+        sys.exit(6 if Path(".claude/hooks/guard.py").read_bytes() == b"guard v1\\n" else 0)
     if rule.startswith("write-then-fail:"):
         Path(rule.split(":", 1)[1]).write_text("made by setup\\n")
         sys.exit(4)
+    if rule.startswith("write-then-fail-if-v2:"):
+        Path(rule.split(":", 1)[1]).write_text("made by setup\\n")
+        sys.exit(4 if Path(".claude/hooks/guard.py").read_bytes() == b"guard v2\\n" else 0)
     print("{} failed on purpose".format(name), file=sys.stderr)
     sys.exit(5)
     """)
@@ -231,8 +238,10 @@ class RunTests(ApplyBase):
         applied = self.apply(staged, policy=self.policy(canary="fail-if-v2"), accept_guard_changes=True)
         self.assertFalse(applied.ok)
         self.assertTrue(applied.rolled_back)
-        self.assertEqual(self.names(), ["setup", "canary", "canary"])                # new run failed, old one after rollback
+        # new canary failed; then the installed setup re-deploys from the restored files, then the old canary
+        self.assertEqual(self.names(), ["setup", "canary", "setup", "canary"])
         self.assertEqual(self.installed(), before)                                   # every byte, nothing left over
+        self.assertIn("re-ran from the restored toolkit", applied.report)
         self.assertFalse((self.root / FAILED).exists())
         self.assertIn(applied.operation, applied.report)
         self.assertIn("canary", applied.report)
@@ -242,11 +251,12 @@ class RunTests(ApplyBase):
     def test_setup_failure_rolls_back_the_same_way(self):
         staged = self.staged({NEW + HOOK: b"guard v2\n"})
         before = self.installed()
-        applied = self.apply(staged, policy=self.policy(setup="write-then-fail:generated.txt"),
+        applied = self.apply(staged, policy=self.policy(setup="write-then-fail-if-v2:generated.txt"),
                              accept_guard_changes=True)
         self.assertFalse(applied.ok)
         self.assertTrue(applied.rolled_back)
-        self.assertEqual(self.names(), ["setup", "canary"])                          # no new canary; old canary after rollback
+        self.assertEqual(self.names(), ["setup", "setup", "canary"])                 # no new canary; setup + old canary
+        self.assertEqual(self.steps()[1][0], "setup")
         self.assertEqual((self.root / "generated.txt").read_text(), "made by setup\n")
         after = self.installed()
         after.pop("generated.txt")
@@ -266,7 +276,10 @@ class RunTests(ApplyBase):
         self.assertTrue(applied.rolled_back)
         self.assertEqual(self.installed(), before)
         self.assertIn("could not start", applied.report)
-        self.assertEqual(self.names(), ["canary"])                                   # only the old canary, after rollback
+        # The installed setup is the missing one, so re-deploying the restored toolkit fails too: fail closed.
+        marker = json.loads((self.root / FAILED).read_text(encoding="utf-8"))
+        self.assertEqual(marker["failed_step"], "setup after rollback")
+        self.assertEqual(self.names(), [])                                           # no canary on an undeployed state
 
     def test_timeout_counts_as_failure(self):
         staged = self.staged({NEW + HOOK: b"guard v2\n"})
@@ -282,7 +295,7 @@ class RunTests(ApplyBase):
         self.assertFalse(applied.ok)
         self.assertTrue(applied.rolled_back)
         self.assertEqual(self.installed(), before)
-        self.assertEqual([entry[2] for entry in seen], [guarded_update.TIMEOUT] * 3)
+        self.assertEqual([entry[2] for entry in seen], [guarded_update.TIMEOUT] * 4)
         self.assertTrue(all(entry[1] == self.root.resolve() for entry in seen))
         self.assertIn("timed out", applied.report)
         self.assertIn("partial canary output", applied.report)
@@ -302,7 +315,7 @@ class RunTests(ApplyBase):
         self.assertFalse(applied.ok)
         self.assertTrue(applied.rolled_back)
         self.assertEqual(self.installed(), before)
-        self.assertEqual(self.names(), ["setup", "new-canary", "canary", "canary"])
+        self.assertEqual(self.names(), ["setup", "new-canary", "canary", "setup", "canary"])
         self.assertTrue((self.root / FAILED).exists())     # the old canary fails on the restored state too: fail closed
 
     def _undo_last_apply(self):
@@ -316,7 +329,7 @@ class RunTests(ApplyBase):
         applied = self.apply(staged, policy=self.policy(canary="fail"), accept_guard_changes=True)
         self.assertFalse(applied.ok)
         self.assertTrue(applied.rolled_back)
-        self.assertEqual(self.names(), ["setup", "canary", "canary"])
+        self.assertEqual(self.names(), ["setup", "canary", "setup", "canary"])
         marker = json.loads((self.root / FAILED).read_text(encoding="utf-8"))
         self.assertEqual(marker["operation"], applied.operation)
         self.assertEqual(marker["to_version"], "4.3.0")
@@ -363,7 +376,7 @@ class RunTests(ApplyBase):
         self.assertTrue(applied.rolled_back)
         self.assertRegex(applied.operation, r"^[0-9a-f]{32}$")
         self.assertEqual(self.installed(), before)
-        self.assertEqual(self.names(), ["canary"])                                   # old canary on the restored state
+        self.assertEqual(self.names(), ["setup", "canary"])                          # re-deploy, then the old canary
         self.assertIn("simulated crash", applied.report)
 
     def test_marker_survives_a_later_upgrade(self):
@@ -416,17 +429,47 @@ class RunTests(ApplyBase):
         self.assertEqual(self.steps()[0][1], list(args))
 
     def test_default_run_uses_no_shell_and_no_console_window(self):
-        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as fake:
-            guarded_update.run(["x", "y z"], self.root, 7)
-        args, kwargs = fake.call_args
-        self.assertEqual(args[0], ["x", "y z"])
-        self.assertIs(kwargs["shell"], False)
-        self.assertEqual(kwargs["timeout"], 7)
+        real = subprocess.Popen
+        seen = []
+
+        def spy(argv, **kwargs):
+            seen.append((argv, kwargs))
+            return real(argv, **kwargs)
+        with mock.patch.object(subprocess, "Popen", side_effect=spy):
+            done = guarded_update.run([sys.executable, "-c", "print('hi')"], self.root, 30)
+        argv, kwargs = seen[0]
+        self.assertEqual(argv, [sys.executable, "-c", "print('hi')"])
+        self.assertIs(kwargs.get("shell", False), False)
         self.assertEqual(Path(kwargs["cwd"]), self.root)
-        self.assertTrue(kwargs["capture_output"])
         self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        for stream in ("stdout", "stderr"):
+            self.assertNotIn(kwargs[stream], (subprocess.PIPE, None))              # a file: a grandchild cannot block it
         if sys.platform == "win32":
             self.assertTrue(kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW)
+        else:
+            self.assertIs(kwargs["start_new_session"], True)
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, b"hi"))
+
+    def test_timeout_kills_the_whole_process_tree(self):
+        pid_file = Path(self.tmp.name) / "grandchild.pid"
+        child = Path(self.tmp.name) / "child.py"
+        child.write_text(textwrap.dedent("""\
+            import subprocess, sys, time
+            grandchild = subprocess.Popen([sys.executable, "-c",
+                "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(120)", sys.argv[1]])
+            print("child started", flush=True)
+            time.sleep(120)
+            """), encoding="utf-8")
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            guarded_update.run([sys.executable, str(child), str(pid_file)], self.root, 4)
+        self.assertLess(time.monotonic() - started, 60)                                 # it returned, it did not hang
+        self.assertIn(b"child started", caught.exception.output or b"")
+        grandchild = int(pid_file.read_text())
+        deadline = time.monotonic() + 15
+        while guarded_update._alive(grandchild) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertIs(guarded_update._alive(grandchild), False)                       # the grandchild is gone too
 
 
 def foreign_journal(root, review="f" * 64):
@@ -603,7 +646,7 @@ class ConcurrencyAndInFlightTests(ApplyBase):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('{"v": 1}')
-        guarded_update.clear_failed(self.root)
+        guarded_update.clear_failed(self.root, force=True)          # no pid: cannot tell, so only a forced clear
         self.assertFalse((self.root / FAILED).exists())
         self.assertFalse((self.root / INFLIGHT).exists())
         state = self.root / ".modding-agent-harness"
@@ -646,6 +689,241 @@ class ConcurrencyAndInFlightTests(ApplyBase):
         installation.apply(root, bundle, review, quiescent=True, reserve=0)
         self.assertEqual((root / "owned.txt").read_bytes(), b"new")
         self.assertEqual((root / INFLIGHT).read_bytes(), record)
+
+    # --- final review wave ---------------------------------------------------------------------------------------
+
+    def put_record(self, data):
+        path = self.root / INFLIGHT
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def dead_pid(self):
+        done = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True, check=True)
+        return int(done.stdout)
+
+    def test_clear_refuses_while_the_recorded_process_is_alive_unless_forced(self):
+        path = self.put_record({"v": 1, "pid": os.getpid(), "started": "2026-11-23T00:00:00Z"})
+        with self.assertRaisesRegex(guarded_update.UpdateRefused, "still running"):
+            guarded_update.clear_failed(self.root)
+        self.assertTrue(path.exists())
+        path.write_text('{"v": 1}')                                     # no pid at all: cannot tell, treated as alive
+        with self.assertRaisesRegex(guarded_update.UpdateRefused, "still running"):
+            guarded_update.clear_failed(self.root)
+        guarded_update.clear_failed(self.root, force=True)
+        self.assertFalse(path.exists())
+
+    def test_clear_goes_through_when_the_recorded_process_is_gone(self):
+        self.assertIs(guarded_update._alive(self.dead_pid()), False)
+        path = self.put_record({"v": 1, "pid": self.dead_pid()})
+        guarded_update.clear_failed(self.root)
+        self.assertFalse(path.exists())
+
+    def test_clear_of_the_failed_marker_alone_needs_no_liveness(self):
+        marker = self.root / FAILED
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{"v": 1}')
+        guarded_update.clear_failed(self.root)
+        self.assertFalse(marker.exists())
+
+    def test_refusal_says_in_progress_or_interrupted_with_pid_and_start(self):
+        self.put_record({"v": 1, "pid": 4242, "started": "2026-11-23T01:02:03Z", "operation": "a" * 32})
+        with self.assertRaises(guarded_update.UpdateRefused) as caught:
+            self.staged()
+        message = str(caught.exception)
+        self.assertIn("in progress or interrupted", message)
+        self.assertIn("pid 4242", message)
+        self.assertIn("2026-11-23T01:02:03Z", message)
+        self.assertIn("a" * 32, message)
+
+    def test_a_kill_during_publication_names_the_journal_in_the_refusal(self):
+        staged = self.staged({NEW + HOOK: b"guard v2\n"})
+        real = installation.durable.atomic_json
+
+        def killed(path, data):
+            if Path(path).name == "000001-published.json":
+                raise KeyboardInterrupt
+            return real(path, data)
+        with mock.patch.object(installation.durable, "atomic_json", side_effect=killed), \
+                self.assertRaises(KeyboardInterrupt):
+            self.apply(staged, accept_guard_changes=True)
+        record = json.loads((self.root / INFLIGHT).read_text(encoding="utf-8"))
+        self.assertIsNone(record["operation"])
+        (journal,) = self.journals()
+        for attempt in (lambda: self.apply(staged, accept_guard_changes=True), self.staged):
+            with self.assertRaises(guarded_update.UpdateRefused) as caught:
+                attempt()
+            self.assertIn(journal, str(caught.exception))
+            self.assertNotIn("OPERATION --quiescent", str(caught.exception))
+
+    def test_a_record_another_updater_creates_after_our_check_is_not_overwritten(self):
+        staged = self.staged()
+        real = guarded_update._snapshot
+        foreign = json.dumps({"v": 1, "nonce": "theirs", "pid": os.getpid()})
+
+        def racing(root):
+            self.put_record(json.loads(foreign))                     # updater B wins the race for the record
+            return real(root)
+        with mock.patch.object(guarded_update, "_snapshot", side_effect=racing):
+            with self.assertRaisesRegex(guarded_update.UpdateRefused, "update-in-flight"):
+                self.apply(staged)
+        self.assertEqual(json.loads((self.root / INFLIGHT).read_text(encoding="utf-8"))["nonce"], "theirs")
+        self.assertEqual(self.journals(), [])
+        self.assertEqual(self.steps(), [])
+
+    def test_settle_removes_only_a_record_that_is_still_ours(self):
+        staged = self.staged()
+        real = guarded_update._default_run
+
+        def run(argv, cwd, timeout):
+            if "canary" in argv:
+                self.put_record({"v": 1, "nonce": "theirs"})             # replaced under us
+            return real(argv, cwd, timeout)
+        applied = self.apply(staged, run=run)
+        self.assertTrue(applied.ok, applied.report)
+        self.assertEqual(json.loads((self.root / INFLIGHT).read_text(encoding="utf-8"))["nonce"], "theirs")
+
+    def test_record_rewrites_keep_the_nonce(self):
+        staged = self.staged()
+        seen = []
+
+        def run(argv, cwd, timeout):
+            seen.append(json.loads((self.root / INFLIGHT).read_text(encoding="utf-8")))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        self.apply(staged, run=run)
+        self.assertRegex(seen[0]["nonce"], r"^[0-9a-f]{32}$")
+        self.assertIsNotNone(seen[0]["operation"])                   # rewritten with the operation, nonce kept
+
+    def cleanup_fault(self, name):
+        """installation.apply fails at `name`, then its own cleanup raises and replaces the UpgradeFailed."""
+        real_json, real_apply = installation.durable.atomic_json, installation.apply
+
+        def fault(path, data):
+            if Path(path).name == name:
+                raise OSError("simulated failure at " + name)
+            return real_json(path, data)
+
+        def apply(*args, **kwargs):
+            try:
+                return real_apply(*args, **kwargs)
+            except installation.UpgradeFailed:
+                raise PermissionError("cleanup of a temp file was blocked by a scanner")
+        return mock.patch.multiple(installation, apply=mock.DEFAULT), fault, apply
+
+    def test_a_cleanup_fault_after_a_partial_publish_still_recovers(self):
+        staged = self.staged({NEW + HOOK: b"guard v2\n"})
+        before = self.installed()
+        _, fault, apply = self.cleanup_fault("000002-published.json")
+        with mock.patch.object(installation.durable, "atomic_json", side_effect=fault), \
+                mock.patch.object(installation, "apply", side_effect=apply):
+            applied = self.apply(staged, accept_guard_changes=True)
+        self.assertFalse(applied.ok)
+        self.assertTrue(applied.rolled_back)
+        self.assertEqual(self.installed(), before)
+        self.assertNotIn("nothing was changed", applied.report)
+        self.assertFalse((self.root / INFLIGHT).exists())
+
+    def test_a_cleanup_fault_with_a_journal_but_no_publication_keeps_the_record(self):
+        staged = self.staged({NEW + HOOK: b"guard v2\n"})
+        before = self.installed()
+        _, fault, apply = self.cleanup_fault("000001-intent.json")
+        with mock.patch.object(installation.durable, "atomic_json", side_effect=fault), \
+                mock.patch.object(installation, "apply", side_effect=apply):
+            applied = self.apply(staged, accept_guard_changes=True)
+        self.assertFalse(applied.ok)
+        self.assertNotIn("nothing was changed", applied.report)
+        self.assertEqual(self.installed(), before)
+        self.assertTrue((self.root / INFLIGHT).exists())             # a journal of ours exists: not a clean refusal
+        self.assertEqual(self.steps(), [])
+
+    def test_a_plain_refusal_with_no_journal_of_ours_is_still_clean(self):
+        staged = self.staged()
+        foreign_journal(self.root)                                     # another review's journal does not count
+        with mock.patch.object(installation, "apply", side_effect=PermissionError("denied before anything")):
+            with self.assertRaisesRegex(guarded_update.UpdateRefused, "nothing was changed"):
+                self.apply(staged)
+        self.assertFalse((self.root / INFLIGHT).exists())
+
+    def test_setup_after_rollback_failing_writes_the_marker(self):
+        staged = self.staged({NEW + HOOK: b"guard v2\n"})
+        applied = self.apply(staged, policy=self.policy(setup="fail-if-v1", canary="fail-if-v2"),
+                             accept_guard_changes=True)
+        self.assertFalse(applied.ok)
+        self.assertTrue(applied.rolled_back)
+        self.assertEqual(self.names(), ["setup", "canary", "setup"])  # no old canary on an undeployed state
+        marker = json.loads((self.root / FAILED).read_text(encoding="utf-8"))
+        self.assertEqual(marker["failed_step"], "setup after rollback")
+        self.assertFalse((self.root / INFLIGHT).exists())
+
+
+class GuardChoiceTests(ApplyBase):
+    """Critical 1: a choice of `candidate` on a guard file the review exempted (the user's own edit, unchanged
+    upstream) replaces guard code, so it needs the guard go; `keep` stays free."""
+
+    def edit(self, name, data):
+        (self.root / name).write_bytes(data)
+
+    def test_candidate_on_a_locally_edited_hook_needs_the_guard_go(self):
+        self.edit(HOOK, b"guard v1 with my own rule\n")
+        staged = self.staged()
+        self.assertFalse(staged.requires_guard_accept)               # the review itself still needs no go
+        self.assertIn(update_review.CONDITIONAL_HEADING, staged.text)
+        self.assertIn("-guard v1 with my own rule", staged.text)
+        before = self.installed()
+        choices = {"setup.sh": "keep", HOOK: "candidate"}
+        with self.assertRaisesRegex(guarded_update.UpdateRefused, "accept-guard-changes") as caught:
+            self.apply(staged, choices=choices)
+        self.assertIn(HOOK, str(caught.exception))
+        self.assertEqual(self.installed(), before)
+        self.assertFalse((self.root / INFLIGHT).exists())
+        applied = self.apply(staged, choices=choices, accept_guard_changes=True)
+        self.assertTrue(applied.ok, applied.report)
+        self.assertEqual((self.root / HOOK).read_bytes(), b"guard v1\n")
+
+    def test_keep_on_a_locally_edited_hook_stays_free(self):
+        self.edit(HOOK, b"guard v1 with my own rule\n")
+        applied = self.apply(self.staged(), choices={"setup.sh": "keep", HOOK: "keep"})
+        self.assertTrue(applied.ok, applied.report)
+        self.assertEqual((self.root / HOOK).read_bytes(), b"guard v1 with my own rule\n")
+
+    def test_candidate_on_a_kept_local_guard_file_needs_the_guard_go(self):
+        # stage_update passes no keep_local, so the upgrader's keep-local row is produced by wrapping its stage call.
+        self.edit(HOOK, b"guard v1 with my own rule\n")
+        real = upgrade.stage_review_bundle
+
+        def keep_hook_local(*args, **kwargs):
+            return real(*args, keep_local=(HOOK,), **kwargs)
+        with mock.patch.object(upgrade, "stage_review_bundle", side_effect=keep_hook_local):
+            staged = self.staged()
+        rows = {r["path"]: r["action"] for r in json.loads((staged.bundle / "complete.json").read_text())["plan"]["files"]}
+        self.assertEqual(rows[HOOK], "preserve_local")
+        before = self.installed()
+        with self.assertRaisesRegex(guarded_update.UpdateRefused, "accept-guard-changes"):
+            self.apply(staged, choices={"setup.sh": "keep", HOOK: "candidate"})
+        self.assertEqual(self.installed(), before)
+        applied = self.apply(staged, choices={"setup.sh": "keep"})              # the default, keep, stays free
+        self.assertTrue(applied.ok, applied.report)
+        self.assertEqual((self.root / HOOK).read_bytes(), b"guard v1 with my own rule\n")
+
+    def test_candidate_on_a_locally_edited_policy_file_needs_the_go_and_both_canaries(self):
+        self.edit(POLICY_FILE, b'{"canary": "mine"}\n')
+        staged = self.staged()
+        self.assertFalse(staged.requires_guard_accept)
+        choices = {"setup.sh": "keep", POLICY_FILE: "candidate"}
+        with self.assertRaisesRegex(guarded_update.UpdateRefused, "accept-guard-changes"):
+            self.apply(staged, choices=choices)
+        with self.assertRaisesRegex(guarded_update.UpdateRefused, "new_policy"):
+            self.apply(staged, choices=choices, accept_guard_changes=True)
+        applied = self.apply(staged, choices=choices, accept_guard_changes=True,
+                             new_policy=self.policy(canary_name="new-canary"))
+        self.assertTrue(applied.ok, applied.report)
+        self.assertEqual(self.names(), ["setup", "new-canary", "canary"])
+
+    def test_keep_on_a_locally_edited_policy_file_needs_neither(self):
+        self.edit(POLICY_FILE, b'{"canary": "mine"}\n')
+        applied = self.apply(self.staged(), choices={"setup.sh": "keep", POLICY_FILE: "keep"})
+        self.assertTrue(applied.ok, applied.report)
+        self.assertEqual(self.names(), ["setup", "canary"])
 
 
 if __name__ == "__main__":

@@ -22,7 +22,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -65,12 +67,57 @@ def _present(path):
     return path.exists() or path.is_symlink()
 
 
+def _read_record(root):
+    """The in-flight record's content, or {} when it is absent or unreadable (callers treat unknown fields as such)."""
+    try:
+        data = _read_json(Path(root) / IN_FLIGHT)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _journals_for(root, review_sha256):
+    """Operation ids under upgrades/ whose plan.json records this review and root (unreadable plans are skipped)."""
+    found = []
+    folder = Path(root) / ".modding-agent-harness" / "upgrades"
+    if not isinstance(review_sha256, str) or not folder.is_dir():
+        return found
+    for path in sorted(folder.iterdir()):
+        if re.fullmatch(r"[0-9a-f]{32}", path.name):
+            try:
+                plan = _read_json(path / "plan.json")
+            except (OSError, ValueError):
+                continue
+            if plan.get("review_sha256") == review_sha256 and plan.get("root") == str(Path(root).resolve()):
+                found.append(path.name)
+    return found
+
+
+def _describe_record(root):
+    """'in progress or interrupted (pid N, started T)' plus what to roll back, for refusals and the session note."""
+    record = _read_record(root)
+    who = "pid {}, started {}".format(record.get("pid", "unknown"), record.get("started", "unknown"))
+    operation = record.get("operation")
+    if isinstance(operation, str) and re.fullmatch(r"[0-9a-f]{32}", operation):
+        what = "its operation is {0} (upgrade-rollback {0} --quiescent)".format(operation)
+    else:
+        try:
+            journals = _journals_for(root, record.get("review_sha256"))
+        except OSError:
+            journals = []
+        what = ("it recorded no operation; journal(s) holding its review: {} (upgrade-rollback <that id> --quiescent)"
+                .format(", ".join(journals)) if journals else
+                "it recorded no operation and no journal holds its review, so I think nothing was published")
+    return "in progress or interrupted ({}); {}".format(who, what)
+
+
 def _refuse_in_flight(root):
     if _present(root / IN_FLIGHT):
         raise UpdateRefused(
-            "an earlier update was interrupted before its outcome was known and left {}: the install may hold an "
-            "unverified guard set. Read it, run the toolkit's canary or roll back its operation (upgrade-rollback "
-            "OPERATION --quiescent), then clear it (update-clear-failed); nothing was changed".format(IN_FLIGHT))
+            "an update is {} and left {}: an unverified guard set may be live. If that process has ended, read the "
+            "file, run the toolkit's canary or roll back the operation, then clear it with update-clear-failed "
+            "(--force when the recorded process cannot be checked); nothing was changed".format(
+                _describe_record(root), IN_FLIGHT))
 
 
 def _discard_earlier_review(work):
@@ -160,11 +207,96 @@ class Applied:
     report: str
 
 
+_OUTPUT_TAIL = 64 * 1024
+
+
+def _alive(pid):
+    """True, False, or None when it cannot be told. Standard library only (ctypes on Windows, signal 0 elsewhere)."""
+    try:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = kernel32.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                error = ctypes.get_last_error()
+                return False if error == 87 else True if error == 5 else None   # no such process / access denied
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return None
+                return code.value == 259                                 # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return None
+
+
+def _kill_tree(process):
+    """Kill the step and everything it started: taskkill /T on Windows, the process group elsewhere."""
+    if os.name == "nt":
+        taskkill = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "taskkill.exe"
+        try:
+            subprocess.run([str(taskkill), "/T", "/F", "/PID", str(process.pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _file_tail(stream):
+    stream.flush()
+    size = stream.seek(0, os.SEEK_END)
+    stream.seek(max(0, size - _OUTPUT_TAIL))
+    return stream.read()
+
+
 def run(argv, cwd, timeout):
-    """Run one setup or canary step: an argv list, never a shell, no console window, stdin closed, output captured."""
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    return subprocess.run(list(argv), cwd=str(cwd), shell=False, timeout=timeout, capture_output=True,
-                          stdin=subprocess.DEVNULL, creationflags=flags)
+    """Run one setup or canary step: an argv list, never a shell, no console window, stdin closed. Output goes to
+    temporary files, not pipes, so a grandchild that keeps them open cannot block the wait; on a timeout (or an
+    interrupt) the whole process tree is killed."""
+    argv = list(argv)
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        options = {"cwd": str(cwd), "stdin": subprocess.DEVNULL, "stdout": out, "stderr": err}
+        if os.name == "nt":
+            options["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            options["start_new_session"] = True
+        process = subprocess.Popen(argv, **options)
+        try:
+            code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(process)
+            raise subprocess.TimeoutExpired(argv, timeout, output=_file_tail(out), stderr=_file_tail(err)) from None
+        except BaseException:
+            _kill_tree(process)
+            raise
+        return subprocess.CompletedProcess(argv, code, _file_tail(out), _file_tail(err))
 
 
 _default_run = run
@@ -277,15 +409,34 @@ def _published_any(root, operation):
         return True
 
 
+def _create_record(root, data):
+    """Create the in-flight record exclusively (O_EXCL): a record another updater made first is never overwritten."""
+    path = root / IN_FLIGHT
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write((json.dumps(data, sort_keys=True, indent=1) + "\n").encode("utf-8"))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _ours(root, nonce):
+    return _read_record(root).get("nonce") == nonce
+
+
 def _record(root, data):
-    """Write the in-flight record. Returns None, or the reason it could not be written."""
+    """Rewrite the in-flight record (keeping its nonce) while it is still ours. Returns None, or why it was not."""
+    if not _ours(root, data.get("nonce")):
+        return "the record is no longer this apply's"
     return _write_marker(root, data, IN_FLIGHT)
 
 
-def _settle(root):
-    """The outcome is final: the in-flight record goes (it is this run's own scratch). Never raises."""
+def _settle(root, nonce):
+    """The outcome is final: remove the in-flight record, but only while it still carries this apply's nonce. Never
+    raises; anything unclear leaves the record in place (fail closed)."""
     try:
-        (root / IN_FLIGHT).unlink(missing_ok=True)
+        if _ours(root, nonce):
+            (root / IN_FLIGHT).unlink()
     except OSError:
         pass
 
@@ -312,10 +463,20 @@ def _write_marker(root, marker, name=FAILED_MARKER):
         return "{}: {}".format(type(exc).__name__, exc)
 
 
-def clear_failed(root):
+def clear_failed(root, force=False):
     """The user has read the failure and fixed its cause: set the failed marker and the in-flight record aside
-    (renamed, kept as evidence, never deleted) so staging works again. Nothing to clear is not an error."""
+    (renamed, kept as evidence, never deleted) so staging works again. Nothing to clear is not an error.
+
+    The in-flight record may belong to an apply that is still running (in the background, or in another session):
+    while its recorded process is alive, or when that cannot be told, this refuses unless `force=True`. The failed
+    marker has no process to check."""
     root = Path(root).resolve()
+    if not force and _present(root / IN_FLIGHT):
+        record = _read_record(root)
+        if _alive(record.get("pid")) is not False:
+            raise UpdateRefused("the apply that wrote {} is still running, or its process cannot be checked ({}). "
+                                "Wait for it, or clear with --force only when you are sure it has ended; nothing was "
+                                "changed".format(IN_FLIGHT, _describe_record(root)))
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     for name in (FAILED_MARKER, IN_FLIGHT):
         path = root / name
@@ -369,9 +530,19 @@ def apply_update(root, policy, bundle, review_sha256, choices, *, accept_guard_c
     rows = review["plan"].get("files")
     if not isinstance(rows, list):
         raise _refused("the review has no file rows")
+    if not isinstance(choices, dict):
+        raise _refused("choices must map each collision and merged settings file to keep, candidate or merged_settings")
     guard, _ = update_review.classify(rows, policy)
+    # A guard file the review exempted (the user's own edit, untouched upstream) still changes when the choice is not
+    # `keep`: that choice needs the same separate go. Re-derived here from complete.json and the installed policy.
+    chosen = [row for row in update_review.conditional_guard_rows(rows, policy)
+              if choices.get(row["path"], "keep") != "keep"]
+    if chosen and accept_guard_changes is not True:
+        raise _refused("choosing other than keep for {} replaces guard code the user changed locally: applying needs "
+                       "the user's separate go for that (--accept-guard-changes)".format(
+                           ", ".join(sorted(row["path"] for row in chosen))))
     policy_names = {name.casefold() for name in policy.policy_files}
-    policy_changed = sorted(row["path"] for row in guard if row["path"].casefold() in policy_names)
+    policy_changed = sorted(row["path"] for row in (*guard, *chosen) if row["path"].casefold() in policy_names)
     if policy_changed and new_policy is None:
         raise _refused("the review changes the toolkit's policy files ({}): the toolkit must pass new_policy, the "
                        "candidate's setup and canary, so both old and new canary can be run"
@@ -379,11 +550,11 @@ def apply_update(root, policy, bundle, review_sha256, choices, *, accept_guard_c
     active = new_policy if policy_changed else policy
     planned = [("setup", _argv(active.setup, "setup")), ("canary", _argv(active.canary, "canary"))]
     old_canary = _argv(policy.canary, "installed canary")
+    old_setup = _argv(policy.setup, "installed setup")
+    installed = (old_setup, old_canary)
     if policy_changed:
         planned.append(("old canary", old_canary))
 
-    if not isinstance(choices, dict):
-        raise _refused("choices must map each collision and merged settings file to keep, candidate or merged_settings")
     paths = {row["path"] for row in rows}
     merged = review.get("merged_settings_hashes")
     needed = {row["path"] for row in rows if row.get("action") == "preserve_collision"}
@@ -395,13 +566,20 @@ def apply_update(root, policy, bundle, review_sha256, choices, *, accept_guard_c
                        + ", ".join(missing))
 
     before = _snapshot(root)
+    nonce = uuid.uuid4().hex
     flight = {"v": 1, "operation": None, "review_sha256": review_sha256, "from_version": from_version,
               "to_version": to_version, "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              "pid": os.getpid()}
-    reason = _record(root, flight)
-    if reason is not None:
-        _settle(root)
-        raise _refused("could not write {} before applying: {}".format(IN_FLIGHT, reason))
+              "pid": os.getpid(), "nonce": nonce}
+    try:
+        _create_record(root, flight)
+    except FileExistsError as exc:
+        raise _refused("another update created {} first: it is {}".format(IN_FLIGHT, _describe_record(root))) from exc
+    except OSError as exc:
+        raise _refused("could not write {} before applying: {}".format(IN_FLIGHT, exc)) from exc
+    try:
+        earlier = {path.name for path in (root / _JOURNALS).iterdir()} if (root / _JOURNALS).is_dir() else set()
+    except OSError:
+        earlier = None
     # From here until the outcome is final, the record stays on disk. It is removed only on a final outcome (never in
     # a `finally`), so a kill, an interrupt or a tool timeout leaves it behind and the next stage or apply refuses.
     try:
@@ -412,7 +590,7 @@ def apply_update(root, policy, bundle, review_sha256, choices, *, accept_guard_c
             # Raised only once OUR journal exists. Identify it positively; a new folder alone may be another updater's.
             operation = _own_operation(root, exc, review_sha256)
             if operation is None:
-                return _unidentified(root, exc, review, choices, from_version, to_version)
+                return _unidentified(root, exc, review, choices, from_version, to_version, nonce)
             flight["operation"] = operation
             _record(root, flight)
             if not _published_any(root, operation):
@@ -421,15 +599,42 @@ def apply_update(root, policy, bundle, review_sha256, choices, *, accept_guard_c
             # Files may already be replaced: recover exactly as after a failed step.
             failed = {"label": "apply", "argv": [], "ok": False, "status": "failed: {}".format(exc),
                       "stdout": [], "stderr": []}
-            return _recover(root, old_canary, runner, notes_files, operation, [failed], failed, before,
-                            review, choices, from_version, to_version)
+            return _recover(root, installed, runner, notes_files, operation, [failed], failed, before,
+                            review, choices, from_version, to_version, nonce)
         except TimeoutError as exc:
             # A bare TimeoutError: every error after the journal exists is wrapped in UpgradeFailed, so this is the
             # lock wait (or the deadline) before anything was written.
             raise _refused("the upgrade lock .modding-agent-harness/upgrade.lock is held by another updater, or apply "
                            "ran out of time before changing anything: {}".format(exc)) from exc
         except (OSError, ValueError) as exc:
-            raise _refused("apply refused: {}".format(exc)) from exc
+            # Normally raised before our journal existed. But installation.apply's own cleanup can raise and replace
+            # an UpgradeFailed (a scanner locking a temp file), so look for a journal of ours before calling it clean.
+            found = _new_journals(root, earlier, review_sha256)
+            if found is None or found[1]:
+                return _unidentified(root, exc, review, choices, from_version, to_version, nonce)
+            ours = found[0]
+            if not ours:
+                raise _refused("apply refused: {}".format(exc)) from exc
+            published = [operation for operation in ours if _published_any(root, operation)]
+            if len(ours) == 1 and published:
+                flight["operation"] = ours[0]
+                _record(root, flight)
+                failed = {"label": "apply", "argv": [], "ok": False, "status": "failed: {}".format(exc),
+                          "stdout": [], "stderr": []}
+                return _recover(root, installed, runner, notes_files, ours[0], [failed], failed, before,
+                                review, choices, from_version, to_version, nonce)
+            if published:
+                return _unidentified(root, exc, review, choices, from_version, to_version, nonce)
+            # A journal of ours exists but records no publication: probably nothing changed, but not provably. The
+            # in-flight record stays (fail closed) and names it.
+            flight["operation"] = ours[0]
+            _record(root, flight)
+            return Applied(False, ours[0], False, "\n".join([
+                "Update {} -> {}: FAILED at apply ({}); NOT rolled back.".format(from_version, to_version, exc),
+                "A journal of this apply exists ({}) but records no publication; the failure replaced the upgrader's "
+                "own error, so this cannot prove nothing changed.".format(", ".join(ours)),
+                "Kept {}: staging and applying refuse until the user checks the install and clears it.".format(
+                    IN_FLIGHT), ""]) + "\n")
         operation = result["operation"]
         flight["operation"] = operation
         _record(root, flight)
@@ -438,11 +643,11 @@ def apply_update(root, policy, bundle, review_sha256, choices, *, accept_guard_c
             step = _step(label, argv, root, runner)
             steps.append(step)
             if not step["ok"]:
-                return _recover(root, old_canary, runner, notes_files, operation, steps, step, before, review,
-                                choices, from_version, to_version)
-        _settle(root)
+                return _recover(root, installed, runner, notes_files, operation, steps, step, before, review,
+                                choices, from_version, to_version, nonce)
+        _settle(root, nonce)
     except UpdateRefused:
-        _settle(root)             # a clean refusal is a final outcome
+        _settle(root, nonce)      # a clean refusal is a final outcome
         raise
     except BaseException as exc:
         # Outcome unknown (an interrupt, or an error nobody expected): keep the record, note what happened, fail closed.
@@ -458,7 +663,30 @@ def apply_update(root, policy, bundle, review_sha256, choices, *, accept_guard_c
     return Applied(True, operation, False, "\n".join(lines) + "\n")
 
 
-def _unidentified(root, exc, review, choices, from_version, to_version):
+def _new_journals(root, earlier, review_sha256):
+    """([ours], [unknown]) among the journal folders that appeared since `earlier`, or None when that cannot be told.
+    Ours: plan.json records this review and root. Unknown: a new folder whose plan cannot be read."""
+    if earlier is None:
+        return None
+    try:
+        names = {path.name for path in (root / _JOURNALS).iterdir()} if (root / _JOURNALS).is_dir() else set()
+    except OSError:
+        return None
+    ours, unknown = [], []
+    for name in sorted(names - earlier):
+        if not _OPERATION.fullmatch(name):
+            continue
+        try:
+            plan = _read_json(_journal(root, name) / "plan.json")
+        except (OSError, ValueError):
+            unknown.append(name)
+            continue
+        if plan.get("review_sha256") == review_sha256 and plan.get("root") == str(root):
+            ours.append(name)
+    return ours, unknown
+
+
+def _unidentified(root, exc, review, choices, from_version, to_version, nonce):
     """`installation.apply` failed after creating a journal, but the failure names no journal we can prove is ours.
     Some files may be replaced and nothing can be rolled back safely: fail closed."""
     marker = {"v": 1, "from_version": from_version, "to_version": to_version, "operation": None,
@@ -466,7 +694,7 @@ def _unidentified(root, exc, review, choices, from_version, to_version):
               "output_tail": "", "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     reason = _write_marker(root, marker)
     if reason is None:
-        _settle(root)
+        _settle(root, nonce)
     lines = ["Update {} -> {}: FAILED at apply ({}); NOT rolled back.".format(from_version, to_version, exc),
              "The failure names no upgrade journal that records this review, so this updater cannot tell which files",
              "it replaced and rolls nothing back. Some files may be replaced.", "",
@@ -496,10 +724,12 @@ def _common(review, choices, steps, published):
     return lines
 
 
-def _recover(root, old_canary, runner, notes_files, operation, steps, failed, before, review, choices,
-             from_version, to_version):
-    """A step failed after files were (or may have been) published: roll back, then the old canary on the restored
-    state. Either of those failing writes the fail-closed marker."""
+def _recover(root, installed, runner, notes_files, operation, steps, failed, before, review, choices,
+             from_version, to_version, nonce):
+    """A step failed after files were (or may have been) published: roll back, re-run the INSTALLED setup on the
+    restored files (so what it deploys outside the install, a live guard copy for example, comes from the restored
+    toolkit again), then the old canary. Any of those failing writes the fail-closed marker."""
+    old_setup, old_canary = installed
     marker = {"v": 1, "from_version": from_version, "to_version": to_version, "operation": operation,
               "first_failure": failed["label"], "first_failure_status": failed["status"],
               "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
@@ -512,12 +742,20 @@ def _recover(root, old_canary, runner, notes_files, operation, steps, failed, be
         marker.update(failed_step="rollback", error="{}: {}".format(type(exc).__name__, exc),
                       output_tail=_output_tail(failed))
         problem = "the rollback failed: {}: {}".format(type(exc).__name__, exc)
+    redeployed = False
     if rolled_back:
-        check = _step("canary after rollback", old_canary, root, runner)
-        steps = [*steps, check]
-        if not check["ok"]:
-            marker.update(failed_step="canary after rollback", output_tail=_output_tail(check))
-            problem = "the installed canary fails on the restored state"
+        again = _step("setup after rollback", old_setup, root, runner)
+        steps = [*steps, again]
+        if not again["ok"]:
+            marker.update(failed_step="setup after rollback", output_tail=_output_tail(again))
+            problem = "the installed setup fails on the restored files, so what it deploys may still be the new version"
+        else:
+            redeployed = True
+            check = _step("canary after rollback", old_canary, root, runner)
+            steps = [*steps, check]
+            if not check["ok"]:
+                marker.update(failed_step="canary after rollback", output_tail=_output_tail(check))
+                problem = "the installed canary fails on the restored state"
     head = ("Update {} -> {}: FAILED at {} ({}); {}.".format(
         from_version, to_version, failed["label"], failed["status"],
         "rolled back to the previous install" if rolled_back else "NOT rolled back"))
@@ -525,12 +763,14 @@ def _recover(root, old_canary, runner, notes_files, operation, steps, failed, be
     if restored is not None:
         lines.append("rollback restored {} file(s), set {} new file(s) aside in {}".format(
             len(restored.get("restored", [])), len(restored.get("retained_new_files", [])), restored.get("journal")))
+    if redeployed:
+        lines.append("setup re-ran from the restored toolkit, so the copies it deploys come from the restored version")
     if problem is None:
-        _settle(root)             # rolled back cleanly and the old canary passes: final
+        _settle(root, nonce)      # rolled back cleanly and the old canary passes: final
     else:
         reason = _write_marker(root, marker)
         if reason is None:
-            _settle(root)         # the marker now carries the fail-closed state
+            _settle(root, nonce)  # the marker now carries the fail-closed state
         lines += ["", "FAIL CLOSED: {}. The guards may be broken or missing.".format(problem)]
         lines.append("Wrote {}; staging refuses until the user reads it, fixes the cause and clears it.".format(
             FAILED_MARKER) if reason is None else
@@ -571,6 +811,8 @@ def add_arguments(subparsers):
                           help="host/editor writers have been stopped; this flag does not stop them")
     clearing = subparsers.add_parser("update-clear-failed", help="set the failed and in-flight markers aside after the "
                                      "user has read them and fixed the cause")
+    clearing.add_argument("--force", action="store_true",
+                          help="clear the in-flight record even though its process is alive or cannot be checked")
     for parser in (staging, applying, clearing):
         parser.add_argument("--installed-root", type=Path)
 
@@ -609,7 +851,7 @@ def handle(args, root, profile, policy, *, notes_files=(), candidate_preparer=No
     if args.command == "update-clear-failed":
         resolved = Path(root).resolve()
         present = [name for name in (FAILED_MARKER, IN_FLIGHT) if _present(resolved / name)]
-        clear_failed(root)
+        clear_failed(root, force=args.force)
         return {"cleared": present}
     raise ValueError("not a guarded update command")
 
@@ -641,8 +883,8 @@ def session_note(root):
         found = []
         meaning = {FAILED_MARKER: "an update failed and could not be rolled back and verified: the guards may be "
                                   "broken or missing",
-                   IN_FLIGHT: "an update was interrupted before its outcome was known: an unverified guard set "
-                              "may be live"}
+                   IN_FLIGHT: "an update is {}: an unverified guard set may be live".format(
+                       _describe_record(root))}
         for name in (FAILED_MARKER, IN_FLIGHT):
             try:
                 os.lstat(Path(root) / name)
