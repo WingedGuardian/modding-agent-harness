@@ -72,7 +72,7 @@ class StageTests(Base):
         self.assertEqual(self.snapshot(), before)                                   # every installed byte, nothing added
         self.assertFalse((self.root / ".modding-agent-harness/upgrades").exists())   # no operation journal: not applied
         self.assertTrue(staged.requires_guard_accept)
-        self.assertEqual(Path(staged.bundle).name, "bundle")
+        self.assertRegex(Path(staged.bundle).name, r"^bundle(-[0-9a-f]{12})?$")
         self.assertNotIn(self.root.resolve(), Path(staged.bundle).resolve().parents)
         complete = json.loads((staged.bundle / "complete.json").read_text())
         self.assertIn("install unchanged", complete["mode"])
@@ -153,10 +153,40 @@ class StageTests(Base):
     def test_staging_again_replaces_the_earlier_review_and_its_meta(self):
         first = self.stage()
         second = self.stage(self.github(extra={NEW + HOOK: b"guard v2\n"}))
-        self.assertEqual(first.bundle, second.bundle)
+        self.assertNotEqual(first.bundle, second.bundle)                          # a fresh bundle folder per fetch
+        self.assertFalse(first.bundle.exists())                                     # the earlier review is gone
+        self.assertTrue(second.bundle.is_dir())
         self.assertNotEqual(first.review_sha256, second.review_sha256)
         meta = json.loads((second.bundle.parent / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["review_sha256"], second.review_sha256)
+        self.assertEqual(meta["review_sha256"], sha((second.bundle / "complete.json").read_bytes()))
+        self.assertNotEqual(meta["review_sha256"], first.review_sha256)             # meta no longer describes the first
+
+    def test_staging_removes_only_earlier_bundle_folders_beside_the_work_folder(self):
+        first = self.stage()
+        work = first.bundle.parent
+        stale = [work / "bundle", work / "bundle-0123456789ab", work / "bundle-fedcba987654"]
+        for folder in stale:
+            (folder / "rollback").mkdir(parents=True)
+            (folder / "complete.json").write_text("{}", encoding="utf-8")
+        keep = [work / "bundle-FEDCBA012345", work / "bundle-0123456789a", work / "bundle-0123456789abc",
+                work / "bundle.old", work / "bundles", work / "mybundle-0123456789ab"]
+        for folder in keep:
+            folder.mkdir()
+        (work / "unpacked-extra").mkdir()
+        candidate = work / "candidate.json"
+        candidate_before = candidate.read_bytes() if candidate.exists() else None
+        if candidate_before is None:
+            candidate.write_bytes(b"{}")
+            candidate_before = b"{}"
+        second = self.stage()
+        self.assertEqual(second.bundle.parent, work)
+        for folder in stale + [first.bundle]:
+            self.assertFalse(folder.exists(), folder.name)
+        for folder in keep + [work / "unpacked", work / "unpacked-extra"]:
+            self.assertTrue(folder.is_dir(), folder.name)
+        self.assertEqual(candidate.read_bytes(), candidate_before)
+        self.assertTrue(second.bundle.is_dir())
 
     def test_a_failed_stage_leaves_no_meta_behind(self):
         first = self.stage()

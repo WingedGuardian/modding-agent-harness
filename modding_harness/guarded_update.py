@@ -120,11 +120,17 @@ def _refuse_in_flight(root):
                 _describe_record(root), IN_FLIGHT))
 
 
+_EARLIER_BUNDLE = re.compile(r"bundle(-[0-9a-f]{12})?")   # the review folder names `release.fetch` has used
+
+
 def _discard_earlier_review(work):
-    """Remove an earlier review of this same version (our own rebuildable scratch beside the unpacked release), so
-    staging again is possible and no meta.json can outlive the bundle it described."""
-    for name in ("bundle", META):
-        path = work / name
+    """Remove every earlier review of this same version (our own rebuildable scratch beside the unpacked release: the
+    legacy `bundle` and each `bundle-<12 hex>` a fetch named), so staging again is possible, earlier bundles do not
+    pile up, and no meta.json can outlive the bundle it described. Only those exact names go; nothing else in the
+    work folder is touched."""
+    paths = [entry for entry in work.iterdir() if _EARLIER_BUNDLE.fullmatch(entry.name)]
+    paths.append(work / META)
+    for path in paths:
         if path.is_symlink() or path.is_file():
             path.unlink()
         elif path.exists():
