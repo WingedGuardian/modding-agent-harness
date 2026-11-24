@@ -214,12 +214,15 @@ name with `{version}` in it, how the note names it, and a function that reads th
   version and the commit its tag points at. It prints the `--source` and `--candidate` paths for `upgrade-preview` and
   `upgrade-stage`, and `--previous`: the installed release's own inventory, from that release's zip (digest-checked,
   hashed in memory, never unpacked), so files the user never touched are not shown as their changes. Without it the
-  review just shows more files to choose on. Nothing installed changes.
+  review just shows more files to choose on. Nothing installed changes. A refused release leaves nothing unpacked,
+  and each fetch names a fresh `bundle-<id>` folder for `upgrade-stage`, so a second try at the same version works.
 
 Checking is on by default. `{"v": 1, "check": false}` in `.modding-agent-harness/updates.json` (a protected local
 file an upgrade never replaces) or `MODDING_HARNESS_UPDATE_CHECK=off` turns it off. The setting is deliberately not in
 `config.json`, which an older core refuses unknown keys in: a rollback past this version would otherwise break the
 save store.
+The file is read as UTF-8 (with or without a BOM) or UTF-16, and `"check"` also takes `"false"`, `"off"` or `0`.
+A settings file that exists but cannot be read turns checking OFF, and `update-check` reports why in `error`.
 
 ## Development CI
 

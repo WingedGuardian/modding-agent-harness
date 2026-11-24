@@ -167,6 +167,37 @@ class CheckTests(Base):
         self.assertEqual(release.check(self.root, profile(), gh, force=True, environ=self.env)["status"], "off")
         self.assertEqual(gh.calls, [])
 
+    def test_the_setting_is_read_in_every_encoding_windows_writes(self):
+        """Release review 4.3 I5: PowerShell 5 writes a UTF-8 BOM (Set-Content -Encoding UTF8) or UTF-16 (`>`)."""
+        settings = self.root / release.SETTINGS
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        body = '{"v": 1, "check": false}'
+        for raw in (body.encode("utf-8-sig"), body.encode("utf-16"), bytes([0xFE, 0xFF]) + body.encode("utf-16-be"),
+                    b'{"v": 1, "check": "false"}', b'{"v": 1, "check": "off"}', b'{"v": 1, "check": 0}'):
+            with self.subTest(raw[:12]):
+                settings.write_bytes(raw)
+                self.assertEqual(release.settings(self.root, self.env), (False, ""))
+
+    def test_a_settings_file_that_cannot_be_read_is_off_and_says_why(self):
+        settings = self.root / release.SETTINGS
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        gh = FakeGitHub()
+        for raw in (b"{not json", b"[1, 2]"):
+            with self.subTest(raw):
+                settings.write_bytes(raw)
+                on, problem = release.settings(self.root, self.env)
+                self.assertFalse(on)
+                self.assertIn("update checks are off", problem)
+                self.assertEqual(release.check(self.root, profile(), gh, force=True, environ=self.env)["status"], "off")
+        self.assertEqual(gh.calls, [])
+
+    def test_checking_stays_on_without_an_opt_out(self):
+        settings = self.root / release.SETTINGS
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        for raw in (b'{"v": 1}', b'{"v": 1, "check": true}', '{"v": 1, "check": true}'.encode("utf-8-sig")):
+            settings.write_bytes(raw)
+            self.assertEqual(release.settings(self.root, self.env), (True, ""))
+
     def test_the_setting_is_a_protected_local_file(self):
         self.assertIn(release.SETTINGS, installation.LOCAL_ONLY)
 
@@ -224,6 +255,33 @@ class FetchTests(Base):
     def test_a_download_address_outside_the_repository_refuses(self):
         with self.assertRaisesRegex(ValueError, "not this repository"):
             release.fetch(self.root, profile(), FakeGitHub(url="https://example.invalid/toolkit-4.3.0.zip"))
+
+    def test_a_download_address_with_dot_segments_or_extras_refuses(self):
+        base = "https://github.com/{}/releases/download/".format(REPO)
+        for url in (base + "v4.3.0/../../../evil/releases/download/v1/toolkit-4.3.0.zip",
+                    base + "v4.3.0/%2e%2e/toolkit-4.3.0.zip", base + "v4.3.0/toolkit-4.3.0.zip?x=1",
+                    "https://user@github.com/{}/releases/download/v4.3.0/toolkit-4.3.0.zip".format(REPO),
+                    "http://github.com/{}/releases/download/v4.3.0/toolkit-4.3.0.zip".format(REPO)):
+            with self.subTest(url):
+                with self.assertRaisesRegex(ValueError, "not this repository"):
+                    release.fetch(self.root, profile(), FakeGitHub(url=url))
+
+    def test_each_fetch_names_a_fresh_review_bundle(self):
+        """Release review 4.3 I6: the upgrader refuses an existing bundle folder, so a retry needs a new one."""
+        first = release.fetch(self.root, profile(), FakeGitHub())
+        Path(first["bundle"]).mkdir(parents=True)                    # as upgrade-stage would leave it
+        second = release.fetch(self.root, profile(), FakeGitHub())
+        self.assertNotEqual(first["bundle"], second["bundle"])
+        self.assertFalse(Path(second["bundle"]).exists())
+
+    def test_a_refused_release_leaves_nothing_unpacked(self):
+        release.fetch(self.root, profile(), FakeGitHub())          # an earlier good fetch of the same version
+        work = release.updates_home(self.root) / "4.3.0"
+        with self.assertRaisesRegex(ValueError, "BUILD-INFO"):
+            release.fetch(self.root, profile(), FakeGitHub(body=make_zip(commit="b" * 40)))
+        self.assertFalse((work / "unpacked").exists())
+        self.assertFalse((work / "candidate.json").exists())
+        self.assertEqual(list(work.glob("*.zip")), [])
 
     def test_nothing_newer_refuses(self):
         with self.assertRaisesRegex(ValueError, "no newer release"):
