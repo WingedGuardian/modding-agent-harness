@@ -55,3 +55,7 @@ Targeted shared policy checks:
 The complete runtime conformance matrix runs on CI. Local fixtures do not certify
 host enforcement or native game behavior. Test selection, result caching,
 parallel test workers, and mutation workspace reuse are not part of this policy.
+
+A change to `modding_harness/guarded_update.py` or `update_review.py` is a change to the update guards: see
+"Guarded updates" in the README. Every new module under `modding_harness/` must be covered by the vendoring test in
+`tests/test_guarded_update_e2e.py`; review the guard-diff, marker and exit-code behaviour, not only the happy path.
