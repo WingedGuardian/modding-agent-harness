@@ -5,7 +5,6 @@ The tables and edit tests are the reviewed packet's (skyrimvr-save-guard-ci 2391
 review rounds of the Skyrim AI Assistant Toolkit v4.3.0, which shipped this detector. They are kept verbatim from
 there and run under unittest: `parametrize` makes one test method per case and `tmp_path` is a fresh directory.
 """
-import os
 import pathlib
 import sys
 import tempfile
@@ -35,8 +34,10 @@ def decide(tool, tool_input):
 INCIDENT = ("    p = subprocess.Popen(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,\n"
             "                         creationflags=NO_WINDOW | 0x00000200 | 0x00000008)  # no window, new group, detached\n")
 
+
 def W(content, path="x.py"):
     return ("Write", {"file_path": path, "content": content})
+
 
 DENY = {
     "incident-write": W(INCIDENT),
@@ -118,6 +119,7 @@ DENY = {
     "backslash-join": W("x = dict(a=1)\ncreationflags = NO_WINDOW \\\n    + 0x8\n"),
 }
 
+
 ALLOW = {
     "prose-docstring": W('"""Windows: a hidden console, never CREATE_NO_WINDOW | DETACHED_PROCESS."""\nx = 1\n'),
     "string-mention": W('msg = "never use DETACHED_PROCESS"\n'),
@@ -198,13 +200,16 @@ as the command word; \"\$PY\" - <<EOF still counts, cat > \"\$NOTES\" <<EOF does
     "read-tool": ("Read", {"file_path": "x.py"}),
 }
 
+
 @pytest.mark.parametrize("name", sorted(DENY))
 def test_denies(name):
     assert decide(*DENY[name]) == "deny", name
 
+
 @pytest.mark.parametrize("name", sorted(ALLOW))
 def test_allows(name):
     assert decide(*ALLOW[name]) == "allow", name
+
 
 def test_small_edit_judged_in_context(tmp_path):
     f = tmp_path / "drive.py"
@@ -214,10 +219,12 @@ def test_small_edit_judged_in_context(tmp_path):
     harmless = {"file_path": str(f), "old_string": "cmd,", "new_string": "cmd2,"}
     assert decide("Edit", harmless) == "allow"
 
+
 def test_edit_elsewhere_in_a_file_with_an_old_bad_line_is_allowed(tmp_path):
     f = tmp_path / "old.py"
     f.write_text("a = Popen(c, creationflags=0x8)\n\n\n\ndef other():\n    return 1\n", encoding="utf-8")
     assert decide("Edit", {"file_path": str(f), "old_string": "return 1", "new_string": "return 2"}) == "allow"
+
 
 def test_edit_below_a_docstring(tmp_path):
     f = tmp_path / "drive.py"
@@ -226,11 +233,13 @@ def test_edit_below_a_docstring(tmp_path):
     edit = {"file_path": str(f), "old_string": "NO_WINDOW | 0x00000200)", "new_string": "NO_WINDOW | 0x00000200 | 0x00000008)"}
     assert decide("Edit", edit) == "deny"
 
+
 def test_replace_all_judges_every_site(tmp_path):
     f = tmp_path / "x.py"
     f.write_text("GROUP = 0x00000200\n\n\n\np = Popen(c, creationflags=NO_WINDOW | 0x00000200)\n", encoding="utf-8")
     edit = {"file_path": str(f), "old_string": "0x00000200", "new_string": "0x00000208", "replace_all": True}
     assert decide("Edit", edit) == "deny"
+
 
 def test_crlf_file_multiline_old_string(tmp_path):
     f = tmp_path / "x.py"
@@ -241,12 +250,14 @@ def test_crlf_file_multiline_old_string(tmp_path):
     harmless = {"file_path": str(f), "old_string": "    | GROUP)\nq = 1", "new_string": "    | GROUP)\nq = 2"}
     assert decide("Edit", harmless) == "allow"
 
+
 def test_multiedit_applies_in_order(tmp_path):
     f = tmp_path / "x.py"
     f.write_text("p = Popen(c,\n    creationflags=NO_WINDOW)\n", encoding="utf-8")
     edits = [{"old_string": "NO_WINDOW)", "new_string": "NO_WINDOW | GROUP)"},
              {"old_string": "GROUP)", "new_string": "GROUP | 0x8)"}]
     assert decide("MultiEdit", {"file_path": str(f), "edits": edits}) == "deny"
+
 
 def test_docstring_edit_in_a_big_file(tmp_path):
     body = ["import subprocess", "", "def outer():", "    if True:", "        x = 1"]
@@ -259,12 +270,14 @@ def test_docstring_edit_in_a_big_file(tmp_path):
             "new_string": "    never NO_WINDOW | DETACHED_PROCESS anywhere"}
     assert decide("Edit", edit) == "allow"
 
+
 def test_multiedit_after_replace_all_keeps_spans(tmp_path):
     f = tmp_path / "x.py"
     f.write_text("foo\nfoo\nfoo\nfoo\nfoo\n\n\n\np = Popen(c,\n    creationflags=NO_WINDOW)\n", encoding="utf-8")
     edits = [{"old_string": "NO_WINDOW)", "new_string": "NO_WINDOW | 0x8)"},
              {"old_string": "foo", "new_string": "x" * 200, "replace_all": True}]
     assert decide("MultiEdit", {"file_path": str(f), "edits": edits}) == "deny"
+
 
 def test_unbalanced_comment_does_not_glue_the_file(tmp_path):
     f = tmp_path / "x.js"
@@ -273,18 +286,15 @@ def test_unbalanced_comment_does_not_glue_the_file(tmp_path):
     edit = {"file_path": str(f), "old_string": "function a() {}", "new_string": "function a() { return 1; }"}
     assert decide("Edit", edit) == "allow"
 
-def _bash():
-    from test_hooks import _bash as b
-    return b()
-
-PATCH = "*** Begin Patch\n*** Add File: drive.py\n+p = Popen(c, creationflags=0x00000008)\n*** End Patch"
 
 def test_a_sentinel_flag_value_without_the_detached_bit_is_allowed():
     """The narrowed scope (user ruling 2026-11-24): only bit 0x8. 0x1234 has 0x10 (a new console) and 0x4, not 0x8."""
     assert decide("Write", {"file_path": "x.py", "content": "Popen(c, creationflags=0x1234)\n"}) == "allow"
 
+
 def test_a_non_code_file_is_never_judged():
     assert decide("Write", {"file_path": "notes.md", "content": INCIDENT}) == "allow"
+
 
 @pytest.mark.parametrize("cmd", [
     'timeout 60 "$PY" -c "Popen(c, creationflags=8)"',
@@ -298,12 +308,14 @@ def test_a_non_code_file_is_never_judged():
 def test_an_interpreter_after_a_prefix_or_as_a_variable_is_seen(cmd):
     assert detached.judge_words(cmd, "bash")
 
+
 @pytest.mark.parametrize("cmd", [
     '& "$env:PY" -c "Popen(c, creationflags=8)"',
     "& ${env:PY} -c 'Popen([''x''], creationflags=8)'",
 ])
 def test_a_powershell_variable_interpreter_is_seen(cmd):
     assert detached.judge_words(cmd, "powershell")
+
 
 @pytest.mark.parametrize("cmd", [
     'timeout 60 "$PY" -c "Popen(c, creationflags=0x08000200)"',
@@ -314,10 +326,12 @@ def test_a_powershell_variable_interpreter_is_seen(cmd):
 def test_words_allow_the_hidden_launch_and_mentions(cmd):
     assert not detached.judge_words(cmd, "bash")
 
+
 @pytest.mark.parametrize("header", ["  *** Add File: drive.py", "*** Add File:drive.py"])
 def test_patch_headers_the_appliers_accept_are_read(header):
     patch = "*** Begin Patch\n" + header + "\n+p = Popen(c, creationflags=0x8)\n*** End Patch\n"
     assert detached.judge_patch(patch)
+
 
 def test_an_updated_file_is_judged_in_the_file(tmp_path):
     """The hunk alone holds no creationflags; the file it lands in does (as an Edit is judged)."""
@@ -328,6 +342,7 @@ def test_an_updated_file_is_judged_in_the_file(tmp_path):
     harmless = "*** Begin Patch\n*** Update File: drive.py\n@@\n-q = 1\n+q = 2\n*** End Patch\n"
     assert not detached.judge_patch(harmless, str(tmp_path))
 
+
 def test_a_docstring_hunk_is_judged_in_the_file_not_alone(tmp_path):
     f = tmp_path / "notes.py"
     f.write_text('def later():\n    """Notes.\n\n    never NO_WINDOW | DETACHED_PROCESS here\n    """\n    return 1\n',
@@ -336,18 +351,21 @@ def test_a_docstring_hunk_is_judged_in_the_file_not_alone(tmp_path):
              "+    never NO_WINDOW | DETACHED_PROCESS anywhere\n*** End Patch\n")
     assert not detached.judge_patch(patch, str(tmp_path))
 
-def test_a_4mb_write_is_judged_well_inside_the_engine_budget():
+
+def test_a_4mb_write_is_judged_well_inside_a_hook_time_limit():
     import time
     big = "".join("def f%d(x):\n    return subprocess.run(['a'], cwd=x, creationflags=0x08000000)  # c\n" % i
                   for i in range(48000))
     assert len(big) > 4_000_000
     t0 = time.perf_counter()
     assert not detached.judge("Write", {"file_path": "x.py", "content": big})
-    assert time.perf_counter() - t0 < 12, "the engine's whole budget is 20 s"
+    assert time.perf_counter() - t0 < 12, "a guard hook's whole time limit is commonly 20-30 s"
+
 
 def test_a_powershell_doubled_quote_keeps_a_string_a_string():
     """'' inside '...' is one quote in PowerShell: the flag here is text in a Python string, not a launch."""
     assert not detached.judge_words("& $py -c 'print(''creationflags=8'')'", "powershell")
+
 
 @pytest.mark.parametrize("cmd", [
     "cat >> notes.md <<'EOF'\n| python -c \"Popen(c, creationflags=8)\" | the bug |\nEOF\n",
@@ -356,6 +374,7 @@ def test_a_powershell_doubled_quote_keeps_a_string_a_string():
 def test_prose_in_a_heredoc_is_not_read_as_commands(cmd):
     assert not detached.judge_words(cmd, "bash")
 
+
 @pytest.mark.parametrize("cmd,shell", [
     ("pwsh -Command \"python -c 'Popen([''x''], creationflags=8)'\"", "powershell"),
     ("bash -lc 'python -c '\"'\"'Popen([\"x\"], creationflags=8)'\"'\"''", "bash"),
@@ -363,9 +382,11 @@ def test_prose_in_a_heredoc_is_not_read_as_commands(cmd):
 def test_a_script_nested_in_a_shell_is_read(cmd, shell):
     assert detached.judge_words(cmd, shell)
 
+
 def test_a_scripts_own_arguments_are_not_code():
     assert not detached.judge_words('python tools/find.py -e "DETACHED_PROCESS|creationflags=8"', "bash")
     assert detached.judge_words('python -X utf8 -c "Popen(c, creationflags=8)"', "bash")
+
 
 def test_a_hunk_lands_after_its_anchor_when_the_context_repeats(tmp_path):
     f = tmp_path / "drive.py"
@@ -375,11 +396,13 @@ def test_a_hunk_lands_after_its_anchor_when_the_context_repeats(tmp_path):
              "*** End Patch\n")
     assert detached.judge_patch(patch, str(tmp_path))
 
+
 def test_a_pure_insertion_after_its_anchor_is_judged_in_the_file(tmp_path):
     f = tmp_path / "drive.py"
     f.write_text("p = Popen(c,\n    creationflags=NO_WINDOW\n    )\n", encoding="utf-8")
     patch = "*** Begin Patch\n*** Update File: drive.py\n@@     creationflags=NO_WINDOW\n+    | 8\n*** End Patch\n"
     assert detached.judge_patch(patch, str(tmp_path))
+
 
 def test_many_hunks_on_a_big_file_stay_fast(tmp_path):
     import time
@@ -390,22 +413,27 @@ def test_many_hunks_on_a_big_file_stay_fast(tmp_path):
     assert not detached.judge_patch(patch, str(tmp_path))
     assert time.perf_counter() - t0 < 12
 
-def test_an_indented_header_inside_an_update_is_context():
+
+def test_an_indented_header_inside_an_update_is_context(tmp_path):
     patch = ("*** Begin Patch\n*** Update File: drive.py\n@@\n  *** Delete File: x\n+p = Popen(c, creationflags=8)\n"
              "*** End Patch\n")
-    assert detached.judge_patch(patch)
+    assert detached.judge_patch(patch, str(tmp_path))   # drive.py is absent there: judged hunk by hunk
+
 
 def test_a_command_after_a_heredoc_is_still_read():
     cmd = "cat > notes.md <<'EOF'\nprose with python -c \"creationflags=8\"\nEOF\npython -c 'Popen(c, creationflags=8)'\n"
     assert detached.judge_words(cmd, "bash")
 
+
 def test_a_backslash_heredoc_body_is_data():
     assert not detached.judge_words("cat >> notes.md <<\\EOF\n| python -c \"creationflags=8\" |\nEOF\n", "bash")
+
 
 def test_a_powershell_here_string_is_data():
     # the apostrophe in "it's" would end a plain quote early; only reading the here-string as one keeps it data
     cmd = "$note = @'\nit's the bug:\n| python -c \"creationflags=8\" |\n'@\nSet-Content notes.md $note"
     assert not detached.judge_words(cmd, "powershell")
+
 
 @pytest.mark.parametrize("cmd", [
     'python /c/x/tools/find.py -e "DETACHED_PROCESS|creationflags=8"',
@@ -415,21 +443,25 @@ def test_a_powershell_here_string_is_data():
 def test_a_script_path_or_module_ends_the_interpreter_options(cmd):
     assert not detached.judge_words(cmd, "bash")
 
+
 def test_a_nested_powershell_body_is_read_with_powershell_quoting():
     cmd = "powershell.exe -Command \"python -c 'print(''creationflags=8'')'\""
     assert not detached.judge_words(cmd, "")
+
 
 def test_only_cmd_takes_a_slash_option():
     assert detached._option("/d", True) and not detached._option("/c/x/find.py", False)
     assert detached._option("${X4_PYI[@]}", False) and not detached._option("$T/find.py", False)
 
-def test_the_adversarial_patch_stays_inside_the_engine_budget(tmp_path):
+
+def test_the_adversarial_patch_stays_inside_a_hook_time_limit(tmp_path):
     import time
     (tmp_path / "big.py").write_text("a\n" * 1_000_000, encoding="utf-8")
     patch = "*** Begin Patch\n*** Update File: big.py\n" + "@@\n a\n a\n-zz\n+b\n" * 1900 + "*** End Patch\n"
     t0 = time.perf_counter()
     detached.judge_patch(patch, str(tmp_path))
-    assert time.perf_counter() - t0 < 15, "the engine's whole budget is 20 s"
+    assert time.perf_counter() - t0 < 15, "a guard hook's whole time limit is commonly 20-30 s"
+
 
 @pytest.mark.parametrize("cmd", [
     "cat <<< \"x\"\npython -c 'Popen([\"x\"], creationflags=8)'\n",
@@ -439,6 +471,7 @@ def test_a_here_string_or_a_shift_does_not_hide_the_next_line(cmd):
     words = detached._words(cmd, "bash")
     assert "python" in words and detached.judge_words(cmd, "bash")
 
+
 @pytest.mark.parametrize("cmd", [
     "# use $(( here\ncat > notes.md <<'EOF'\n| python -c \"creationflags=8\" |\nEOF\n",
     "echo $(( ((x)) << y ))\ncat > notes.md <<'EOF'\n| python -c \"creationflags=8\" |\nEOF\n",
@@ -446,8 +479,10 @@ def test_a_here_string_or_a_shift_does_not_hide_the_next_line(cmd):
 def test_a_comment_or_nested_brackets_do_not_unbalance_arithmetic(cmd):
     assert not detached.judge_words(cmd, "bash")
 
+
 def test_a_detached_launch_after_arithmetic_is_still_seen():
     assert detached.judge_words("echo $(( ((x)) << y ))\npython -c 'Popen([\"x\"], creationflags=8)'\n", "bash")
+
 
 # ---- core API: judge() reads shell words, the exempt list is the caller's ----------------------------------------
 
@@ -508,6 +543,34 @@ def test_a_non_code_file_and_another_tool_are_not_judged():
     assert decide("Bash", {"command": None}) == "allow"
 
 
+def test_a_patch_on_an_updated_file_adding_the_named_flag_is_reported(tmp_path):
+    patch = ("*** Begin Patch\n*** Update File: drive.py\n@@\n p = Popen(c,\n-    creationflags=NO_WINDOW)\n"
+             "+    creationflags=NO_WINDOW | DETACHED_PROCESS)\n*** End Patch")
+    assert detached.judge_patch(patch, str(tmp_path))
+
+
+def test_a_patch_that_removes_the_flag_is_not_reported(tmp_path):
+    # the removed and the added line are one statement: a removed line judged as still there would report it
+    patch = ("*** Begin Patch\n*** Update File: drive.py\n@@\n p = Popen(c,\n"
+             "-    creationflags=NO_WINDOW | DETACHED_PROCESS,\n+    creationflags=NO_WINDOW,\n     cwd=x)\n*** End Patch")
+    assert detached.judge_patch(patch, str(tmp_path)) is None
+
+
+def test_a_command_that_only_mentions_a_patch_is_not_judged_as_one():
+    msg = "*** Begin Patch\n*** Add File: drive.py\n+p = Popen(c, creationflags=8)\n*** End Patch"
+    assert decide("Bash", {"command": ["git", "commit", "-m", msg]}) == "allow"
+
+
+def test_a_relative_edit_path_is_read_against_cwd(tmp_path):
+    (tmp_path / "drive.py").write_text("p = subprocess.Popen(cmd,\n    creationflags=NO_WINDOW | 0x00000200)\n",
+                                       encoding="utf-8")
+    edit = {"file_path": "drive.py", "old_string": "NO_WINDOW | 0x00000200)",
+            "new_string": "NO_WINDOW | 0x00000200 | 0x00000008)"}
+    # the new text alone holds no creationflags: only reading the file (found through cwd) sees the bit
+    assert detached.judge("Edit", edit) is None
+    assert detached.judge("Edit", edit, cwd=str(tmp_path))
+
+
 class DetachedLaunchTest(unittest.TestCase):
     pass
 
@@ -538,6 +601,7 @@ def _method(fn, kwargs):
 
 for _name, _fn in list(globals().items()):
     if _name.startswith("test_") and callable(_fn):
+        _fn.__test__ = False   # collected through DetachedLaunchTest only, also under pytest
         for _i, _kw in enumerate(_cases(_fn)):
             _label = "_".join("".join(ch if ch.isalnum() else "_" for ch in str(v))[:40] for v in _kw.values())
             setattr(DetachedLaunchTest, "{}_{}{}".format(_name, _i, "_" + _label if _label else ""), _method(_fn, _kw))

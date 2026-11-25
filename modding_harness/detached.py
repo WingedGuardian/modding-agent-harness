@@ -11,8 +11,9 @@ deliberate, visible work and is NOT reported.
 
 Game- and agent-neutral; a toolkit's guard decides what a finding means. Every judge returns the offending statement
 (text) or None:
-- judge(tool, inp): a Claude Code-shaped call. Write / Edit / MultiEdit / NotebookEdit on code files (an edit is judged
-  on the file AFTER the edit, statement by statement around the changed lines); Bash / PowerShell / Monitor commands.
+- judge(tool, inp, exempt=EXEMPT, cwd=""): a Claude Code-shaped call. Write / Edit / MultiEdit / NotebookEdit on code
+  files (an edit is judged on the file AFTER the edit, statement by statement around the changed lines; a relative
+  path is read against CWD); Bash / PowerShell / Monitor commands, read by judge_shell AND judge_words.
 - judge_shell(command): inline -c / -e / -Command scripts after an interpreter (bare, quoted path or variable),
   heredoc, here-string and <<< bodies fed to an interpreter or written to a code file, and quoted text written to a
   code file.
@@ -22,7 +23,9 @@ Game- and agent-neutral; a toolkit's guard decides what a finding means. Every j
 - judge_patch(text, cwd=""): an apply_patch text (Codex and OpenCode grammar). An added file whole; an updated file in
   the file on disk around its added lines; a hunk that cannot be placed, on its own lines. Removed lines are gone.
 - judge_text(path, text, spans=None): TEXT as the content of code file PATH.
-Each takes `exempt` where it reads a path: paths ending in one of these are never judged (the detector's own files).
+`exempt` (judge, judge_patch, judge_text): file paths ending in one of these "/"-separated entries are never judged
+(case-sensitive). It REPLACES the default: a toolkit passes `EXEMPT + (its own guard and test files,)`. It applies to
+the files a call writes, not to a file a shell command writes (`cat > path <<EOF` is judged whatever the path).
 
 Reported: DETACHED_PROCESS USED as a flag (not its definition or a mask test), a creationflags value with bit 0x8,
 Node `detached: true`.
@@ -31,7 +34,10 @@ Known limits:
 - A flag built at run time (arithmetic, a variable holding 8, a helper's keyword argument) or a launch inside a script
   the command only names is not seen; code generated inside Python string literals is not read.
 - Helpers started with pythonw or a .pyw are not reported (also console-less; some legitimate helpers run that way).
-- A write is judged on its first 4 MB; a command past 20,000 words is read as text only.
+- judge() judges a Write on its first 4,000,000 characters (judge_text and judge_patch have no cap); the words of a
+  command past its first 20,000 are read as text only.
+- A variable command word after a prefix is read as an interpreter, so its -e / -p / -c value is judged as code:
+  `timeout 30 "$RG" -e 'creationflags=8' src` is reported (a search for the flag text through a variable).
 - A patch with more than 2,000 hunks, or whose hunks take over 5 s to place in the file, is judged hunk by hunk.
 - An interpreter's option is assumed to take at most one value (`python -B script.py -c` reads -c as python's).
 - Node `detached: true` is reported anywhere in JS/TS code, a test asserting it is absent included.
@@ -40,9 +46,10 @@ Known limits:
 
 Errors are not caught here: a caller that must fail open catches them and records that the call was not judged.
 
-Provenance: the statement detector is the reviewed packet WingedGuardian/skyrimvr-save-guard-ci @23918cc
-(no_detached_launch/no-detached-launch.py); the word and patch readers are from the Skyrim AI Assistant Toolkit
-v4.3.0 (tools/skyguard/detached.py), after four review rounds.
+Provenance: the statement detector (blank, statements, first_bad, judge_shell and the file half of judge) is the
+reviewed packet WingedGuardian/skyrimvr-save-guard-ci @23918cc (no_detached_launch/no-detached-launch.py); the word
+and patch readers are from the Skyrim AI Assistant Toolkit v4.3.0 (tools/skyguard/detached.py), after four review
+rounds. Changed here: `exempt` is the caller's, judge() takes `cwd`, and judge() also reads shell words.
 """
 from __future__ import annotations
 
@@ -64,7 +71,6 @@ NODE_DETACHED = re.compile(r"""(?:\bdetached["']?\s*:|\.detached\s*=)\s*true\b""
 CODE_FILES = (".py", ".pyw", ".pyi", ".ps1", ".psm1", ".psd1", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".cs",
               ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".ahk", ".bat", ".cmd", ".sh", ".bash", ".zsh", ".vbs",
               ".rs", ".go", ".java", ".ipynb")
-# the detector and its own tests name the flag on purpose; they stay editable
 # Paths never judged: this detector and its tests must stay editable. A toolkit passes its own list as `exempt`.
 EXEMPT = ("modding_harness/detached.py", "tests/test_detached.py")
 INTERP_NAMES = r"(?:python[\d.]*w?|py|pythonw|node|deno|bun|pwsh|powershell|bash|sh|cmd)(?:\.exe)?"
@@ -449,10 +455,11 @@ def judge_shell(command):
     return None
 
 
-def judge(tool, inp, exempt=EXEMPT):
+def judge(tool, inp, exempt=EXEMPT, cwd=""):
     """The offending statement for this Claude Code-shaped call (TOOL and its input dict INP), or None.
-    Shell tools (Bash, PowerShell, Monitor) are read as text and as words; file tools on code files only."""
-    path = str(inp.get("file_path") or inp.get("notebook_path") or "").replace("\\", "/")
+    Shell tools (Bash, PowerShell, Monitor) are read as text and as words; file tools on code files only, a relative
+    path read against CWD."""
+    path = str(_resolve(inp.get("file_path") or inp.get("notebook_path") or "", cwd)).replace("\\", "/")
     if tool in ("Bash", "PowerShell", "Monitor"):
         command = inp.get("command")
         if isinstance(command, list):

@@ -285,13 +285,15 @@ visible console (`CREATE_NEW_CONSOLE`, `Start-Process`) is deliberate and is not
 
 It only finds; the toolkit's guard decides what a finding does. Each judge returns the offending statement or `None`:
 
-- `judge(tool, tool_input, exempt=EXEMPT)`: a Claude Code-shaped call. Write / Edit / MultiEdit / NotebookEdit on
-  code files (an edit is judged on the file after the edit), and Bash / PowerShell / Monitor commands, read both as
-  statements and as shell words.
-- `judge_shell(command)`, `judge_words(command, shell="")`, `judge_patch(text, cwd="", exempt=EXEMPT)`,
-  `judge_text(path, text, spans=None, exempt=EXEMPT)`: the readers `judge()` uses, for other hosts' shapes (a Codex
-  argv list, an `apply_patch` text, OpenCode's camelCase file tools after mapping their keys).
-- `exempt`: paths ending in one of these are never judged. Pass the toolkit's own guard and test files.
+- `judge(tool, tool_input, exempt=EXEMPT, cwd="")`: a Claude Code-shaped call. Write / Edit / MultiEdit /
+  NotebookEdit on code files (an edit is judged on the file after the edit; a relative path is read against `cwd`),
+  and Bash / PowerShell / Monitor commands, read with both `judge_shell` and `judge_words`.
+- `judge_shell(command)` and `judge_words(command, shell="")` read a command; `judge_patch(text, cwd="",
+  exempt=EXEMPT)` reads an `apply_patch` text; `judge_text(path, text, spans=None, exempt=EXEMPT)` reads a file's new
+  content. Use them for other hosts' shapes: a Codex argv list, an `apply_patch`, OpenCode's camelCase file tools
+  after mapping their keys.
+- `exempt`: file paths ending in one of these `/`-separated entries are never judged (case-sensitive). It replaces
+  the default, so pass `detached.EXEMPT + (<your guard and test files>,)` to keep the vendored detector editable.
 
 Errors are not caught. This check preserves nothing, so a guard should fail OPEN on an error, and say so (an audit
 line naming the error), rather than refuse every edit. The module docstring lists the known limits.
