@@ -275,6 +275,29 @@ not succeed (rolled back, or failed closed), 2 a refusal before anything changed
 - Verification is GitHub's published digest and the release's `BUILD-INFO` only: an attacker holding the repository
   account controls both. The core cannot tell who typed the go; it checks the flags, never the person.
 
+## No detached launches
+
+`modding_harness/detached.py` finds code or commands that start a process DETACHED (Windows `DETACHED_PROCESS`,
+0x8). A detached process has no console, so every console program it starts gets its own visible window: measured,
+a helper polling through `powershell.exe` once a second gave the user a pop-up every second. `CREATE_NO_WINDOW`
+(optionally with `CREATE_NEW_PROCESS_GROUP`) hides the console and still lets the child outlive its caller. A new
+visible console (`CREATE_NEW_CONSOLE`, `Start-Process`) is deliberate and is not reported.
+
+It only finds; the toolkit's guard decides what a finding does. Each judge returns the offending statement or `None`:
+
+- `judge(tool, tool_input, exempt=EXEMPT, cwd="")`: a Claude Code-shaped call. Write / Edit / MultiEdit /
+  NotebookEdit on code files (an edit is judged on the file after the edit; a relative path is read against `cwd`),
+  and Bash / PowerShell / Monitor commands, read with both `judge_shell` and `judge_words`.
+- `judge_shell(command)` and `judge_words(command, shell="")` read a command; `judge_patch(text, cwd="",
+  exempt=EXEMPT)` reads an `apply_patch` text; `judge_text(path, text, spans=None, exempt=EXEMPT)` reads a file's new
+  content. Use them for other hosts' shapes: a Codex argv list, an `apply_patch`, OpenCode's camelCase file tools
+  after mapping their keys.
+- `exempt`: file paths ending in one of these `/`-separated entries are never judged (case-sensitive). It replaces
+  the default, so pass `detached.EXEMPT + (<your guard and test files>,)` to keep the vendored detector editable.
+
+Errors are not caught. This check preserves nothing, so a guard should fail OPEN on an error, and say so (an audit
+line naming the error), rather than refuse every edit. The module docstring lists the known limits.
+
 ## Development CI
 
 Start with a draft pull request for fast checks. Mark it ready for complete qualification; see [Contributing](CONTRIBUTING.md).

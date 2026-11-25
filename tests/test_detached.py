@@ -1,0 +1,613 @@
+"""No detached launches (modding_harness.detached): the DENY / ALLOW tables, the edit-in-context, patch and
+shell-word tests.
+
+The tables and edit tests are the reviewed packet's (skyrimvr-save-guard-ci 23918cc); the rest were written in the four
+review rounds of the Skyrim AI Assistant Toolkit v4.3.0, which shipped this detector. Their bodies are kept from there
+(two timing tests renamed, one patch test given a directory); the tests after "core API" are the core's own. They run
+under unittest: `parametrize` makes one test method per case and `tmp_path` is a fresh directory.
+"""
+import pathlib
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from modding_harness import detached  # noqa: E402
+
+
+class _Mark:
+    @staticmethod
+    def parametrize(argnames, values):
+        def wrap(fn):
+            fn.__dict__.setdefault("_cases", []).append(([a.strip() for a in argnames.split(",")], list(values)))
+            return fn
+        return wrap
+
+
+class pytest:  # noqa: N801 -- the kept tests are written against pytest's names
+    mark = _Mark()
+
+
+def decide(tool, tool_input):
+    return "deny" if detached.judge(tool, tool_input) else "allow"
+
+
+INCIDENT = ("    p = subprocess.Popen(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,\n"
+            "                         creationflags=NO_WINDOW | 0x00000200 | 0x00000008)  # no window, new group, detached\n")
+
+
+def W(content, path="x.py"):
+    return ("Write", {"file_path": path, "content": content})
+
+
+DENY = {
+    "incident-write": W(INCIDENT),
+    "named-constant": W("subprocess.Popen(c, creationflags=subprocess.DETACHED_PROCESS)\n"),
+    "named-or": ("Edit", {"file_path": "missing.py", "old_string": "a", "new_string": "flags = CREATE_NO_WINDOW | DETACHED_PROCESS\n"}),
+    "named-or-spaced": W("base = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP\n"),
+    "or-assign": W("flags |= subprocess.DETACHED_PROCESS\n"),
+    "plain-assign": W("flags = subprocess.DETACHED_PROCESS\nPopen(c, creationflags=flags)\n"),
+    "create-process": W("win32process.CreateProcess(None, cmd, None, None, 0, win32process.DETACHED_PROCESS, None, None, si)\n"),
+    "c-multiline": W("ok = CreateProcessW(NULL, cmd, NULL, NULL, FALSE,\n    DETACHED_PROCESS,\n    NULL, NULL, &si, &pi);\n", "x.cpp"),
+    "cpp-scope": W("BOOL ok = ::CreateProcessW(NULL, cmd, NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi);\n", "x.cpp"),
+    "multiline-paren": W("p = Popen(c, creationflags=(\n    NO_WINDOW |\n    0x8))\n"),
+    "trailing-or": W("p = Popen(c, creationflags=NO_WINDOW |\n    subprocess.DETACHED_PROCESS,\n    cwd=x)\n"),
+    "csharp-trailing-or": W("uint flags = CREATE_NO_WINDOW |\n    DETACHED_PROCESS;\n", "x.cs"),
+    "dict-key":W('kw = {"creationflags": 0x8}\n'),
+    "kw-index": W('kw["creationflags"] = 8\n'),
+    "rust": W("Command::new(x).creation_flags(0x8).spawn()?;\n", "x.rs"),
+    "detached-with-startupinfo":W("Popen(c, creationflags=0x8 | 0x10, startupinfo=si)\n"),
+    "node-detached": W("spawn(cmd, args, { detached: true, stdio: 'ignore' })\n", "x.js"),
+    "short-hex": ("Edit", {"file_path": "missing.py", "old_string": "a", "new_string": "Popen(c, creationflags=0x8)"}),
+    "decimal": W("Popen(c, creationflags=8)"),
+    "leading-zero": W("Popen(c, creationflags=0008)"),
+    "combined-literal": W("Popen(c, creationflags=0x08000208)"),
+    "hash-in-string": W('Popen(["echo", " #1"], creationflags=8)\n'),
+    "uppercase-ext": W("Popen(c, creationflags=0x8)\n", "X.PY"),
+    "backslash-path": W("Popen(c, creationflags=0x8)\n", "C:\\work\\x.py"),
+    "multiedit": ("MultiEdit", {"file_path": "missing.py", "edits": [{"old_string": "a", "new_string": "ok = 1"},
+                                                                     {"old_string": "b", "new_string": "Popen(c, creationflags=0x00000008)"}]}),
+    "bash-inline": ("Bash", {"command": "python -c \"import subprocess;subprocess.Popen(['x'],creationflags=0x00000008)\""}),
+    "bash-heredoc-python": ("Bash", {"command": "python - <<'EOF'\nimport subprocess\nsubprocess.Popen(['x'], creationflags=0x8)\nEOF"}),
+    "bash-heredoc-to-file": ("Bash", {"command": "cat > drive.py <<'EOF'\np = Popen(c, creationflags=NO_WINDOW | 0x8)\nEOF"}),
+    "bash-list-command": ("Bash", {"command": ["python", "-c", "Popen(c, creationflags=0x8)"]}),
+    "powershell-inline": ("PowerShell", {"command": "python -c \"import subprocess as s; s.Popen(['x'], creationflags=s.DETACHED_PROCESS)\""}),
+    "monitor": ("Monitor", {"command": "python -c \"from subprocess import *; Popen(['x'], creationflags=8)\""}),
+    "notebook": ("NotebookEdit", {"notebook_path": "n.ipynb", "new_source": "Popen(c, creationflags=DETACHED_PROCESS)"}),
+    "same-name-elsewhere": W(INCIDENT, "C:/x/other/test_no_detached_launch.py"),
+    # re-review (R2-R11)
+    "usage-constant-then-code": W('USAGE = """run it\n"""\np = Popen(c, creationflags=0x8)\ndef main():\n    """Entry."""\n'),
+    "echo-to-code-file": ("Bash", {"command": 'echo "p = Popen(c, creationflags=0x8)" > drive.py'}),
+    "printf-append-code-file": ("Bash", {"command": "printf '%s\\n' 'flags |= subprocess.DETACHED_PROCESS' >> x.py"}),
+    "ps-herestring-set-content": ("PowerShell", {"command": "@'\nPopen(c, creationflags=0x8)\n'@ | Set-Content drive.py"}),
+    "ps-herestring-python": ("PowerShell", {"command": "@'\nimport subprocess\nsubprocess.Popen(['x'], creationflags=subprocess.DETACHED_PROCESS)\n'@ | python -"}),
+    "bash-c-nested": ("Bash", {"command": "bash -c \"python -c 'import subprocess as s; s.Popen([1], creationflags=s.DETACHED_PROCESS)'\""}),
+    "cmd-c-nested": ("PowerShell", {"command": "cmd /c \"python -c \\\"Popen(c, creationflags=0x8)\\\"\""}),
+    "inline-single-quote": ("Bash", {"command": "python -c 'Popen(c, creationflags=0x8)'"}),
+    "node-dot-detached": W("opts.detached = true;\nspawn(cmd, args, opts);\n", "x.js"),
+    "node-json-detached": W('spawn(cmd, args, {"detached": true});\n', "x.js"),
+    "c-define": W("#define FLAGS (NO_WINDOW | DETACHED_PROCESS)\n", "x.c"),
+    "js-glob-string":W('globby("src/**/*.js");\nspawn(cmd, args, {detached: true});\n/** doc */\n', "x.js"),
+    "sh-glob": W('cp build/* out/\nnode -e "spawn(c, {detached: true})"\nls */\n', "x.sh"),
+    "python-floor-div-then-flag": W("half = n // 2; p = Popen(c, creationflags=0x8)\n"),
+    "printf-multiline-to-code": ("Bash", {"command": "printf '%s' 'import subprocess\nsubprocess.Popen(c, creationflags=0x8)' > x.py"}),
+    "pwsh-option-values": ("PowerShell", {"command": "pwsh -NoProfile -ExecutionPolicy Bypass -Command \"python -c 'import subprocess as s; s.Popen([1], creationflags=s.DETACHED_PROCESS)'\""}),
+    "python-x-utf8": ("Bash", {"command": 'python -X utf8 -c "Popen(c, creationflags=8)"'}),
+    "bash-lc": ("Bash", {"command": "bash -lc \"python -c 'import subprocess as s; s.Popen([1], creationflags=s.DETACHED_PROCESS)'\""}),
+    # X4 port review (2026-11-24): quoted / variable interpreters and code on stdin
+    # review of a256f41: positional fallback, keyword before a group, Go
+    "var-python-heredoc": ("Bash", {"command": "\"$PY\" - <<'EOF'\nimport subprocess\nsubprocess.Popen(['x'], creationflags=8)\nEOF"}),
+    "getattr-fallback":W('Popen(c, creationflags=getattr(subprocess, "DETACHED_PROCESS", 0x00000008))\n'),
+    "getattr-fallback-or": W('Popen(c, creationflags=NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 8))\n'),
+    "keyword-else-group": W("Popen(c, creationflags=NO_WINDOW if quiet else (0x200 | 0x8))\n"),
+    "go-sysprocattr": W("cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.DETACHED_PROCESS}\n", "x.go"),
+    "or-in-parens":W("flags = (DETACHED_PROCESS | GROUP)\n"),
+    "quoted-path-interp":("Bash", {"command": '"C:/Program Files/Python313/python.exe" -c "Popen(c, creationflags=8)"'}),
+    "dq-var-interp": ("Bash", {"command": '"$PY" -c "Popen(c, creationflags=8)"'}),
+    "bare-var-interp": ("Bash", {"command": '$PY -c "Popen(c, creationflags=8)"'}),
+    "braced-var-interp": ("Bash", {"command": '${X4_PY} -B -c "Popen(c, creationflags=8)"'}),
+    "variable-interp-in-loop": ("Bash", {"command": 'for f in x; do $cmd -c "creationflags=0x8"; done'}),
+    "ps-amp-path": ("PowerShell", {"command": '& "C:\\Python313\\python.exe" -c "Popen(c, creationflags=8)"'}),
+    "ps-amp-var": ("PowerShell", {"command": '& $py -c "Popen(c, creationflags=8)"'}),
+    "echo-pipe-python": ("Bash", {"command": 'echo "Popen(c, creationflags=8)" | python -'}),
+    "here3-python": ("Bash", {"command": 'python <<< "Popen(c, creationflags=8)"'}),
+    "ps-string-pipe-python": ("PowerShell", {"command": "'Popen(c, creationflags=8)' | python -"}),
+    "node-p": ("Bash", {"command": 'node -p "spawn(c, {detached: true})"'}),
+    "bash-lc-writes-code":("Bash", {"command": "bash -lc \"echo 'Popen(c, creationflags=8)' > x.py\""}),
+    "js-slashes-in-string": W('spawn(" //x", {detached: true});\n', "x.js"),
+    "spawn-only-use":W("spawn(cmd, DETACHED_PROCESS)\n", "x.js"),
+    "leading-or-join": W("var creationflags = NO_WINDOW\n    | 0x8;\n", "x.cs"),
+    "backslash-join": W("x = dict(a=1)\ncreationflags = NO_WINDOW \\\n    + 0x8\n"),
+}
+
+
+ALLOW = {
+    "prose-docstring": W('"""Windows: a hidden console, never CREATE_NO_WINDOW | DETACHED_PROCESS."""\nx = 1\n'),
+    "string-mention": W('msg = "never use DETACHED_PROCESS"\n'),
+    # user 2026-11-24: deliberately visible terminal work is allowed; only detaching (the spam) is refused
+    "visible-new-console": W("Popen(c, creationflags=subprocess.CREATE_NEW_CONSOLE)\n"),
+    "visible-new-console-literal": W("Popen(c, creationflags=0x10)\n"),
+    "visible-console-startupinfo-none": W("Popen(c, creationflags=CREATE_NEW_CONSOLE, startupinfo=None)\n"),
+    "start-process-visible": ("PowerShell", {"command": "Start-Process pwsh -ArgumentList '-NoExit','-Command','Get-Content log.txt -Wait'"}),
+    "hidden-new-console": W("si.wShowWindow = SW_HIDE\np = subprocess.run(c, creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=si)\n"),
+    "hidden-new-console-literal": W("si.wShowWindow = win32con.SW_HIDE\np = subprocess.run(c, creationflags=0x10, startupinfo=si)\n"),
+    "multiline-prose-string": W('X = """\nNO_WINDOW | DETACHED_PROCESS\n"""\n'),
+    "string-holds-flags": W('raise SystemExit("never use creationflags=0x8")\n'),
+    "inline-print-flags": ("Bash", {"command": "python -c \"print('was creationflags=8')\""}),
+    "bracket-string-in-value": W('p = Popen(c, creationflags=pick("(", 0x200), timeout=8)\n'),
+    "grep-c-after-python": ("Bash", {"command": 'python -m pytest -q; grep -c "DETACHED_PROCESS|creationflags=8" tools/x.py'}),
+    "sed-e-after-py": ("Bash", {"command": "py -3 a.py | sed -e 's/creationflags=0x8 | DETACHED_PROCESS//'"}),
+    "js-string-holds-use": W('const msg = "flags = DETACHED_PROCESS was the bug";\n', "x.js"),
+    "python-heredoc-prose":("Bash", {"command": "python - <<'EOF'\nrep('''Scope: never creationflags=NO_WINDOW | 0x8,\nflags = DETACHED_PROCESS is the bug''')\nEOF"}),
+    "echo-pipe-python-prose": ("Bash", {"command": "echo \"print('''flags = DETACHED_PROCESS''')\" | python -"}),
+    # real false positive of the deployed ac71e24 hook (2026-11-24): nested "$(git -C "..." ...)" quoting before a
+    # commit message that quotes the flag's spelling with \" escapes and mentions <<EOF
+    "commit-msg-nested-quotes": ("Bash", {"command": r'''cd .. && git add -A x && git -c user.email="$(git -C "/c/G G/S" config user.email)" commit -q -m "fix
+
+A1 getattr(subprocess, \"DETACHED_PROCESS\", 0x8) fallback was blanked; A2 else (A | 0x8) follows; A3 any \$VAR
+as the command word; \"\$PY\" - <<EOF still counts, cat > \"\$NOTES\" <<EOF does not)." && git push -q'''}),
+    "heredoc-to-var-notes":("Bash", {"command": "cat > \"$NOTES\" <<'EOF'\ndrop creationflags=NO_WINDOW | DETACHED_PROCESS\nEOF"}),
+    "ps-herestring-to-var": ("PowerShell", {"command": "@'\ndrop creationflags=NO_WINDOW | DETACHED_PROCESS\n'@ | Set-Content $notesPath"}),
+    "rg-var-pattern": ("Bash", {"command": 'rg "$PAT" -e "creationflags=8" tools'}),
+    "git-var-c": ("Bash",{"command": '$GIT -c "user.name=x" commit -m "y"'}),
+    # X4 port review (2026-11-24): false positives that are not launches
+    "assert-flag-absent": W("assert not (kw['creationflags'] & subprocess.DETACHED_PROCESS)\n"),
+    "constants-table": W("DETACHED_PROCESS = 0x00000008\nCREATE_NO_WINDOW = 0x08000000\n"),
+    "blocklist-tuple": W("BANNED = (subprocess.DETACHED_PROCESS, 'x')\n"),
+    "flag-from-table-index": W("p = Popen(c, creationflags=table[8])\n"),
+    "flag-from-call-arg": W("p = Popen(c, creationflags=pick(level=8))\n"),
+    "rg-unquoted": ("Bash", {"command": "rg -n creationflags=8 ."}),
+    "fstring-prose": W('HELP = f"""\nUse NO_WINDOW | {GROUP}, never DETACHED_PROCESS | creationflags=0x8\n"""\n'),
+    "write-then-commit": ("Bash", {"command": 'git show HEAD~1:tools/v.py > old.py && git commit -m "drop creationflags=0x8"'}),
+    "write-then-search": ("Bash", {"command": 'git show HEAD~1:tools/v.py > old.py && rg "DETACHED_PROCESS|creationflags=8" old.py'}),
+    "python-floor-div": W("half = n // 2\nPopen(c, creationflags=NO_WINDOW)\n"),
+    "js-block-comment":W("/* old: spawn(c, {detached: true}) */\nspawn(c, {windowsHide: true});\n", "x.js"),
+    "js-bracket-in-string": W('let o = "(";\nconsole.log(DETACHED_PROCESS);\nspawn(c);\n', "x.js"),
+    "unbalanced-regex-literal": W("let r = /[(]/;\n" + "let z = 1;\n" * 60 + "console.log(DETACHED_PROCESS);\nspawn(c);\n", "x.js"),
+    "definition-then-launch": W("win32con.DETACHED_PROCESS = 0x8; Popen(c)\n"),
+    "js-template-in-call": W("run(`\ncreationflags: NO_WINDOW\nretries: 8\n`);\n", "x.js"),
+    "ps-herestring-notes":("PowerShell", {"command": "@'\ncreationflags=0x8 was the bug\n'@ | Set-Content notes.md"}),
+    "echo-to-notes":("Bash", {"command": 'echo "creationflags=0x8 was the bug" > notes.md'}),
+    "multiline-commit": ("Bash", {"command": "git commit -m 'fix\n\nflags = DETACHED_PROCESS was the bug'"}),
+    "flag-then-other-kwargs":W("p = subprocess.run(cmd, capture_output=True, creationflags=0x08000000, timeout=120)\n"),
+    "value-ends-at-line": W('options = dict(\n    x=1)\nif nt:\n    options["creationflags"] = NO_WINDOW\nelse:\n    tail = 64 * 1024 + 8\n'),
+    "code-in-long-string": W("patch('''\nif nt:\n    options[\"creationflags\"] = NO_WINDOW\ntail = 64 * 1024 + 8\n''')\n"),
+    "bracket-in-string": W('opener = "("\nprint(subprocess.DETACHED_PROCESS)\nx = 1\n'),
+    "name-read-not-used":W("print(subprocess.DETACHED_PROCESS)\n"),
+    "token-compare":W('if tok.string == "DETACHED_PROCESS":\n    bad = True\n'),
+    "removes-flag-name": W("Popen(c, creationflags=flags & ~subprocess.DETACHED_PROCESS)\n"),
+    "removes-flag-literal": W("Popen(c, creationflags=flags & ~0x8)\n"),
+    "grep-search": ("Bash", {"command": r'grep -rn "0x00000008\|DETACHED_PROCESS" tools --include=*.py'}),
+    "rg-search": ("Bash", {"command": 'rg -n "DETACHED_PROCESS|creationflags" tools'}),
+    "select-string": ("PowerShell", {"command": "Select-String -Pattern 'DETACHED_PROCESS|CREATE_NO_WINDOW' *.py"}),
+    "git-commit": ("Bash", {"command": 'git commit -m "drop DETACHED_PROCESS: was creationflags=0x8"'}),
+    "docstring-flags": W('def f():\n    """Was creationflags=0x8 once; now hidden."""\n    return 1\n'),
+    "heredoc-to-notes": ("Bash", {"command": "cat > notes.md <<'EOF'\ncreationflags=NO_WINDOW | DETACHED_PROCESS\nEOF"}),
+    "markdown-note": W(INCIDENT, "notes.md"),
+    "own-test-file": W(INCIDENT, "C:\\x\\tests\\test_detached.py"),
+    "own-detector": W(INCIDENT, "C:/x/tools/modding_harness/detached.py"),
+    "own-tests": W(INCIDENT, "/src/core/tests/test_detached.py"),
+    "hidden-only": W("Popen(c, creationflags=0x08000000)\n"),
+    "hidden-group": W("Popen(c, creationflags=NO_WINDOW | 0x00000200)\n"),
+    "named-no-window": W("Popen(c, creationflags=subprocess.CREATE_NO_WINDOW)\n"),
+    "the-fix-comment": W("    creationflags=NO_WINDOW | 0x00000200)  # hidden console, new group. NEVER detached (0x8):\n"),
+    "comment-holds-old-flags": W("x = Popen(c, creationflags=NO_WINDOW)  # was creationflags=NO_WINDOW | 0x00000008\n"),
+    "comment-slash": W("x = spawn(c, {windowsHide: true}); // was detached: true\n", "x.js"),
+    "comment-names-it": W("# never use DETACHED_PROCESS here\nx = 1\n"),
+    "batch-rem": W("REM creationflags=8 DETACHED_PROCESS = bad\r\n:: Popen(c, creationflags=8)\r\necho ok\r\n", "x.bat"),
+    "unrelated-0x8": W("caps = 0x1000 | 0x400000 | 0x8\n"),
+    "huge-literal": W("Popen(c, creationflags=0x100000008)\n"),
+    "plain-bash": ("Bash", {"command": "git status"}),
+    "read-tool": ("Read", {"file_path": "x.py"}),
+}
+
+
+@pytest.mark.parametrize("name", sorted(DENY))
+def test_denies(name):
+    assert decide(*DENY[name]) == "deny", name
+
+
+@pytest.mark.parametrize("name", sorted(ALLOW))
+def test_allows(name):
+    assert decide(*ALLOW[name]) == "allow", name
+
+
+def test_small_edit_judged_in_context(tmp_path):
+    f = tmp_path / "drive.py"
+    f.write_text("p = subprocess.Popen(cmd,\n    creationflags=NO_WINDOW | 0x00000200)\n", encoding="utf-8")
+    edit = {"file_path": str(f), "old_string": "NO_WINDOW | 0x00000200)", "new_string": "NO_WINDOW | 0x00000200 | 0x00000008)"}
+    assert decide("Edit", edit) == "deny"
+    harmless = {"file_path": str(f), "old_string": "cmd,", "new_string": "cmd2,"}
+    assert decide("Edit", harmless) == "allow"
+
+
+def test_edit_elsewhere_in_a_file_with_an_old_bad_line_is_allowed(tmp_path):
+    f = tmp_path / "old.py"
+    f.write_text("a = Popen(c, creationflags=0x8)\n\n\n\ndef other():\n    return 1\n", encoding="utf-8")
+    assert decide("Edit", {"file_path": str(f), "old_string": "return 1", "new_string": "return 2"}) == "allow"
+
+
+def test_edit_below_a_docstring(tmp_path):
+    f = tmp_path / "drive.py"
+    f.write_text('"""Driver for the headless run.\n\nMore text.\n"""\nimport subprocess\n'
+                 "p = subprocess.Popen(cmd,\n    creationflags=NO_WINDOW | 0x00000200)\n", encoding="utf-8")
+    edit = {"file_path": str(f), "old_string": "NO_WINDOW | 0x00000200)", "new_string": "NO_WINDOW | 0x00000200 | 0x00000008)"}
+    assert decide("Edit", edit) == "deny"
+
+
+def test_replace_all_judges_every_site(tmp_path):
+    f = tmp_path / "x.py"
+    f.write_text("GROUP = 0x00000200\n\n\n\np = Popen(c, creationflags=NO_WINDOW | 0x00000200)\n", encoding="utf-8")
+    edit = {"file_path": str(f), "old_string": "0x00000200", "new_string": "0x00000208", "replace_all": True}
+    assert decide("Edit", edit) == "deny"
+
+
+def test_crlf_file_multiline_old_string(tmp_path):
+    f = tmp_path / "x.py"
+    f.write_bytes(b"p = subprocess.Popen(cmd,\r\n    creationflags=NO_WINDOW\r\n    | GROUP)\r\nq = 1\r\n")
+    # the new text alone holds no creationflags: only judging it IN the file (LF-normalised) sees the bit
+    edit = {"file_path": str(f), "old_string": "NO_WINDOW\n    | GROUP)", "new_string": "NO_WINDOW\n    | GROUP | 8)"}
+    assert decide("Edit", edit) == "deny"
+    harmless = {"file_path": str(f), "old_string": "    | GROUP)\nq = 1", "new_string": "    | GROUP)\nq = 2"}
+    assert decide("Edit", harmless) == "allow"
+
+
+def test_multiedit_applies_in_order(tmp_path):
+    f = tmp_path / "x.py"
+    f.write_text("p = Popen(c,\n    creationflags=NO_WINDOW)\n", encoding="utf-8")
+    edits = [{"old_string": "NO_WINDOW)", "new_string": "NO_WINDOW | GROUP)"},
+             {"old_string": "GROUP)", "new_string": "GROUP | 0x8)"}]
+    assert decide("MultiEdit", {"file_path": str(f), "edits": edits}) == "deny"
+
+
+def test_docstring_edit_in_a_big_file(tmp_path):
+    body = ["import subprocess", "", "def outer():", "    if True:", "        x = 1"]
+    body += ["        y = %d" % i for i in range(300)]
+    body += ["    z = 2"]  # a window starting inside the 8-space block cannot tokenize this dedent
+    body += ["", "def later():", '    """Notes.', "", "    never NO_WINDOW | DETACHED_PROCESS here", '    """', "    return 1", ""]
+    f = tmp_path / "big.py"
+    f.write_text("\n".join(body), encoding="utf-8")
+    edit = {"file_path": str(f), "old_string": "    never NO_WINDOW | DETACHED_PROCESS here",
+            "new_string": "    never NO_WINDOW | DETACHED_PROCESS anywhere"}
+    assert decide("Edit", edit) == "allow"
+
+
+def test_multiedit_after_replace_all_keeps_spans(tmp_path):
+    f = tmp_path / "x.py"
+    f.write_text("foo\nfoo\nfoo\nfoo\nfoo\n\n\n\np = Popen(c,\n    creationflags=NO_WINDOW)\n", encoding="utf-8")
+    edits = [{"old_string": "NO_WINDOW)", "new_string": "NO_WINDOW | 0x8)"},
+             {"old_string": "foo", "new_string": "x" * 200, "replace_all": True}]
+    assert decide("MultiEdit", {"file_path": str(f), "edits": edits}) == "deny"
+
+
+def test_unbalanced_comment_does_not_glue_the_file(tmp_path):
+    f = tmp_path / "x.js"
+    f.write_text("/**\n * see (below\n */\nfunction a() {}\n" + "let z = 1;\n" * 60 + "spawn(c, {detached: true});\n",
+                 encoding="utf-8")
+    edit = {"file_path": str(f), "old_string": "function a() {}", "new_string": "function a() { return 1; }"}
+    assert decide("Edit", edit) == "allow"
+
+
+def test_a_sentinel_flag_value_without_the_detached_bit_is_allowed():
+    """The narrowed scope (user ruling 2026-11-24): only bit 0x8. 0x1234 has 0x10 (a new console) and 0x4, not 0x8."""
+    assert decide("Write", {"file_path": "x.py", "content": "Popen(c, creationflags=0x1234)\n"}) == "allow"
+
+
+def test_a_non_code_file_is_never_judged():
+    assert decide("Write", {"file_path": "notes.md", "content": INCIDENT}) == "allow"
+
+
+@pytest.mark.parametrize("cmd", [
+    'timeout 60 "$PY" -c "Popen(c, creationflags=8)"',
+    'env FOO=1 "$PY" -c "Popen(c, creationflags=8)"',
+    'PYTHONUTF8=1 "$PY" -c "Popen(c, creationflags=8)"',
+    'nohup "$PY" -c "Popen(c, creationflags=8)"',
+    '"$PY" "${X4_PYI[@]}" -c "Popen(c, creationflags=8)"',
+    '"${PY:-python}" -c "Popen(c, creationflags=8)"',
+    "python -c 'import subprocess as s; s.Popen(['\"'\"'x'\"'\"'], creationflags=8)'",
+])
+def test_an_interpreter_after_a_prefix_or_as_a_variable_is_seen(cmd):
+    assert detached.judge_words(cmd, "bash")
+
+
+@pytest.mark.parametrize("cmd", [
+    '& "$env:PY" -c "Popen(c, creationflags=8)"',
+    "& ${env:PY} -c 'Popen([''x''], creationflags=8)'",
+])
+def test_a_powershell_variable_interpreter_is_seen(cmd):
+    assert detached.judge_words(cmd, "powershell")
+
+
+@pytest.mark.parametrize("cmd", [
+    'timeout 60 "$PY" -c "Popen(c, creationflags=0x08000200)"',
+    "echo python -c 'creationflags=8'",
+    "git commit -m 'creationflags=8 is refused now'",
+    'rg "creationflags=8" tools',
+])
+def test_words_allow_the_hidden_launch_and_mentions(cmd):
+    assert not detached.judge_words(cmd, "bash")
+
+
+@pytest.mark.parametrize("header", ["  *** Add File: drive.py", "*** Add File:drive.py"])
+def test_patch_headers_the_appliers_accept_are_read(header):
+    patch = "*** Begin Patch\n" + header + "\n+p = Popen(c, creationflags=0x8)\n*** End Patch\n"
+    assert detached.judge_patch(patch)
+
+
+def test_an_updated_file_is_judged_in_the_file(tmp_path):
+    """The hunk alone holds no creationflags; the file it lands in does (as an Edit is judged)."""
+    f = tmp_path / "drive.py"
+    f.write_text("p = subprocess.Popen(cmd,\n    creationflags=NO_WINDOW\n    | GROUP)\nq = 1\n", encoding="utf-8")
+    patch = "*** Begin Patch\n*** Update File: drive.py\n@@\n-    | GROUP)\n+    | GROUP | 8)\n q = 1\n*** End Patch\n"
+    assert detached.judge_patch(patch, str(tmp_path))
+    harmless = "*** Begin Patch\n*** Update File: drive.py\n@@\n-q = 1\n+q = 2\n*** End Patch\n"
+    assert not detached.judge_patch(harmless, str(tmp_path))
+
+
+def test_a_docstring_hunk_is_judged_in_the_file_not_alone(tmp_path):
+    f = tmp_path / "notes.py"
+    f.write_text('def later():\n    """Notes.\n\n    never NO_WINDOW | DETACHED_PROCESS here\n    """\n    return 1\n',
+                 encoding="utf-8")
+    patch = ("*** Begin Patch\n*** Update File: notes.py\n@@\n-    never NO_WINDOW | DETACHED_PROCESS here\n"
+             "+    never NO_WINDOW | DETACHED_PROCESS anywhere\n*** End Patch\n")
+    assert not detached.judge_patch(patch, str(tmp_path))
+
+
+def test_a_4mb_write_is_judged_well_inside_a_hook_time_limit():
+    import time
+    big = "".join("def f%d(x):\n    return subprocess.run(['a'], cwd=x, creationflags=0x08000000)  # c\n" % i
+                  for i in range(48000))
+    assert len(big) > 4_000_000
+    t0 = time.perf_counter()
+    assert not detached.judge("Write", {"file_path": "x.py", "content": big})
+    assert time.perf_counter() - t0 < 12, "a guard hook's whole time limit is commonly 20-30 s"
+
+
+def test_a_powershell_doubled_quote_keeps_a_string_a_string():
+    """'' inside '...' is one quote in PowerShell: the flag here is text in a Python string, not a launch."""
+    assert not detached.judge_words("& $py -c 'print(''creationflags=8'')'", "powershell")
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat >> notes.md <<'EOF'\n| python -c \"Popen(c, creationflags=8)\" | the bug |\nEOF\n",
+    "git commit -F - <<EOF\nFix (python -c \"Popen(c, creationflags=8)\") so it doesn't pop up\nEOF\n",
+])
+def test_prose_in_a_heredoc_is_not_read_as_commands(cmd):
+    assert not detached.judge_words(cmd, "bash")
+
+
+@pytest.mark.parametrize("cmd,shell", [
+    ("pwsh -Command \"python -c 'Popen([''x''], creationflags=8)'\"", "powershell"),
+    ("bash -lc 'python -c '\"'\"'Popen([\"x\"], creationflags=8)'\"'\"''", "bash"),
+])
+def test_a_script_nested_in_a_shell_is_read(cmd, shell):
+    assert detached.judge_words(cmd, shell)
+
+
+def test_a_scripts_own_arguments_are_not_code():
+    assert not detached.judge_words('python tools/find.py -e "DETACHED_PROCESS|creationflags=8"', "bash")
+    assert detached.judge_words('python -X utf8 -c "Popen(c, creationflags=8)"', "bash")
+
+
+def test_a_hunk_lands_after_its_anchor_when_the_context_repeats(tmp_path):
+    f = tmp_path / "drive.py"
+    f.write_text("def first():\n    p = Popen(c,\n        x)\n\n\ndef second():\n    q = Popen(c,\n"
+                 "        creationflags=NO_WINDOW\n        x)\n", encoding="utf-8")
+    patch = ("*** Begin Patch\n*** Update File: drive.py\n@@ def second():\n-        x)\n+        | 8, x)\n"
+             "*** End Patch\n")
+    assert detached.judge_patch(patch, str(tmp_path))
+
+
+def test_a_pure_insertion_after_its_anchor_is_judged_in_the_file(tmp_path):
+    f = tmp_path / "drive.py"
+    f.write_text("p = Popen(c,\n    creationflags=NO_WINDOW\n    )\n", encoding="utf-8")
+    patch = "*** Begin Patch\n*** Update File: drive.py\n@@     creationflags=NO_WINDOW\n+    | 8\n*** End Patch\n"
+    assert detached.judge_patch(patch, str(tmp_path))
+
+
+def test_many_hunks_on_a_big_file_stay_fast(tmp_path):
+    import time
+    f = tmp_path / "big.py"
+    f.write_text("a\n" * 1_000_000, encoding="utf-8")
+    patch = "*** Begin Patch\n*** Update File: big.py\n" + "@@\n a\n+b\n" * 100_000 + "*** End Patch\n"
+    t0 = time.perf_counter()
+    assert not detached.judge_patch(patch, str(tmp_path))
+    assert time.perf_counter() - t0 < 12
+
+
+def test_an_indented_header_inside_an_update_is_context(tmp_path):
+    patch = ("*** Begin Patch\n*** Update File: drive.py\n@@\n  *** Delete File: x\n+p = Popen(c, creationflags=8)\n"
+             "*** End Patch\n")
+    assert detached.judge_patch(patch, str(tmp_path))   # drive.py is absent there: judged hunk by hunk
+
+
+def test_a_command_after_a_heredoc_is_still_read():
+    cmd = "cat > notes.md <<'EOF'\nprose with python -c \"creationflags=8\"\nEOF\npython -c 'Popen(c, creationflags=8)'\n"
+    assert detached.judge_words(cmd, "bash")
+
+
+def test_a_backslash_heredoc_body_is_data():
+    assert not detached.judge_words("cat >> notes.md <<\\EOF\n| python -c \"creationflags=8\" |\nEOF\n", "bash")
+
+
+def test_a_powershell_here_string_is_data():
+    # the apostrophe in "it's" would end a plain quote early; only reading the here-string as one keeps it data
+    cmd = "$note = @'\nit's the bug:\n| python -c \"creationflags=8\" |\n'@\nSet-Content notes.md $note"
+    assert not detached.judge_words(cmd, "powershell")
+
+
+@pytest.mark.parametrize("cmd", [
+    'python /c/x/tools/find.py -e "DETACHED_PROCESS|creationflags=8"',
+    'python "$T/find.py" -e "DETACHED_PROCESS|creationflags=8"',
+    'python -m tools.find -e "DETACHED_PROCESS|creationflags=8"',
+])
+def test_a_script_path_or_module_ends_the_interpreter_options(cmd):
+    assert not detached.judge_words(cmd, "bash")
+
+
+def test_a_nested_powershell_body_is_read_with_powershell_quoting():
+    cmd = "powershell.exe -Command \"python -c 'print(''creationflags=8'')'\""
+    assert not detached.judge_words(cmd, "")
+
+
+def test_only_cmd_takes_a_slash_option():
+    assert detached._option("/d", True) and not detached._option("/c/x/find.py", False)
+    assert detached._option("${X4_PYI[@]}", False) and not detached._option("$T/find.py", False)
+
+
+def test_the_adversarial_patch_stays_inside_a_hook_time_limit(tmp_path):
+    import time
+    (tmp_path / "big.py").write_text("a\n" * 1_000_000, encoding="utf-8")
+    patch = "*** Begin Patch\n*** Update File: big.py\n" + "@@\n a\n a\n-zz\n+b\n" * 1900 + "*** End Patch\n"
+    t0 = time.perf_counter()
+    detached.judge_patch(patch, str(tmp_path))
+    assert time.perf_counter() - t0 < 15, "a guard hook's whole time limit is commonly 20-30 s"
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat <<< \"x\"\npython -c 'Popen([\"x\"], creationflags=8)'\n",
+    "echo $((flags<<shift))\npython -c 'Popen([\"x\"], creationflags=8)'\n",
+])
+def test_a_here_string_or_a_shift_does_not_hide_the_next_line(cmd):
+    words = detached._words(cmd, "bash")
+    assert "python" in words and detached.judge_words(cmd, "bash")
+
+
+@pytest.mark.parametrize("cmd", [
+    "# use $(( here\ncat > notes.md <<'EOF'\n| python -c \"creationflags=8\" |\nEOF\n",
+    "echo $(( ((x)) << y ))\ncat > notes.md <<'EOF'\n| python -c \"creationflags=8\" |\nEOF\n",
+])
+def test_a_comment_or_nested_brackets_do_not_unbalance_arithmetic(cmd):
+    assert not detached.judge_words(cmd, "bash")
+
+
+def test_a_detached_launch_after_arithmetic_is_still_seen():
+    assert detached.judge_words("echo $(( ((x)) << y ))\npython -c 'Popen([\"x\"], creationflags=8)'\n", "bash")
+
+
+# ---- core API: judge() reads shell words, the exempt list is the caller's ----------------------------------------
+
+@pytest.mark.parametrize("argv", [
+    ["python", "-c", "import subprocess as s; s.Popen(['x'], creationflags=8)"],
+    ["pwsh", "-NoProfile", "-Command", "python -c \"import subprocess as s; s.Popen(['x'], creationflags=8)\""],
+    ["bash", "-lc", "node -e \"spawn(c, a, {detached: true})\""],
+    ["python", "-c", "v = a<<b\nsubprocess.Popen(['x'], creationflags=8)"],
+])
+def test_an_argv_command_list_is_judged(argv):
+    """A command given as an argv list is joined with quoting, and the script after -c is still read (a `<<` inside
+    it is code, not a heredoc that would hide the next line)."""
+    assert decide("Bash", {"command": argv}) == "deny"
+
+
+@pytest.mark.parametrize("tool,cmd", [
+    ("Bash", 'PYTHONUTF8=1 "$PY" -c "Popen(c, creationflags=8)"'),
+    ("Bash", 'timeout 60 "$PY" -c "Popen(c, creationflags=8)"'),
+    ("Bash", 'nohup "$PY" -c "Popen(c, creationflags=8)"'),
+    ("Bash", 'env A=1 "$PY" -c "Popen(c, creationflags=8)"'),
+    ("Bash", '"$PY" "${PYI[@]}" -c "Popen(c, creationflags=8)"'),
+    ("Bash", '"${PY:-python}" -c "Popen(c, creationflags=8)"'),
+    ("PowerShell", "& \"$env:PY\" -c 'Popen(c, creationflags=8)'"),
+    ("PowerShell", "& ${env:PY} -c 'Popen(c, creationflags=8)'"),
+])
+def test_an_interpreter_behind_a_prefix_or_a_variable_is_judged(tool, cmd):
+    """An earlier port of the statement detector documented these as not caught; judge() also reads the words."""
+    assert decide(tool, {"command": cmd}) == "deny"
+
+
+def test_a_shell_command_is_also_read_by_words():
+    cmd = 'PYTHONUTF8=1 "$PY" -c "Popen(c, creationflags=8)"'
+    assert detached.judge_shell(cmd) is None          # the statement detector alone misses it ...
+    assert detached.judge_words(cmd, "bash")          # ... the word reader finds it, and judge() asks both
+    assert decide("Bash", {"command": cmd}) == "deny"
+
+
+def test_powershell_quoting_is_used_for_the_powershell_tool():
+    # '' inside a PowerShell single-quoted string is a quote: the flag is text in a string, not code
+    cmd = "& $py -c 'x = ''creationflags=8'''"
+    assert decide("PowerShell", {"command": cmd}) == "allow"
+
+
+def test_the_callers_exempt_list_replaces_the_default():
+    bad = ("Write", {"file_path": "/t/tools/guard/own_check.py", "content": INCIDENT})
+    assert decide(*bad) == "deny"
+    assert detached.judge(*bad, exempt=("tools/guard/own_check.py",)) is None
+    assert detached.judge("Write", {"file_path": "/t/tools/modding_harness/detached.py", "content": INCIDENT},
+                          exempt=("tools/guard/own_check.py",))
+    patch = "*** Begin Patch\n*** Add File: tools/guard/own_check.py\n+p = Popen(c, creationflags=8)\n*** End Patch"
+    assert detached.judge_patch(patch)
+    assert detached.judge_patch(patch, exempt=("tools/guard/own_check.py",)) is None
+
+
+def test_a_non_code_file_and_another_tool_are_not_judged():
+    assert decide("Write", {"file_path": "notes.md", "content": INCIDENT}) == "allow"
+    assert decide("Read", {"file_path": "x.py"}) == "allow"
+    assert decide("Bash", {"command": None}) == "allow"
+
+
+def test_a_patch_on_an_updated_file_adding_the_named_flag_is_reported(tmp_path):
+    patch = ("*** Begin Patch\n*** Update File: drive.py\n@@\n p = Popen(c,\n-    creationflags=NO_WINDOW)\n"
+             "+    creationflags=NO_WINDOW | DETACHED_PROCESS)\n*** End Patch")
+    assert detached.judge_patch(patch, str(tmp_path))
+
+
+def test_a_patch_that_removes_the_flag_is_not_reported(tmp_path):
+    # the removed and the added line are one statement: a removed line judged as still there would report it
+    patch = ("*** Begin Patch\n*** Update File: drive.py\n@@\n p = Popen(c,\n"
+             "-    creationflags=NO_WINDOW | DETACHED_PROCESS,\n+    creationflags=NO_WINDOW,\n     cwd=x)\n*** End Patch")
+    assert detached.judge_patch(patch, str(tmp_path)) is None
+
+
+def test_a_command_that_only_mentions_a_patch_is_not_judged_as_one():
+    msg = "*** Begin Patch\n*** Add File: drive.py\n+p = Popen(c, creationflags=8)\n*** End Patch"
+    assert decide("Bash", {"command": ["git", "commit", "-m", msg]}) == "allow"
+
+
+def test_a_relative_edit_path_is_read_against_cwd(tmp_path):
+    (tmp_path / "drive.py").write_text("p = subprocess.Popen(cmd,\n    creationflags=NO_WINDOW | 0x00000200)\n",
+                                       encoding="utf-8")
+    edit = {"file_path": "drive.py", "old_string": "NO_WINDOW | 0x00000200)",
+            "new_string": "NO_WINDOW | 0x00000200 | 0x00000008)"}
+    # the new text alone holds no creationflags: only reading the file (found through cwd) sees the bit
+    assert detached.judge("Edit", edit) is None
+    assert detached.judge("Edit", edit, cwd=str(tmp_path))
+
+
+class DetachedLaunchTest(unittest.TestCase):
+    pass
+
+
+def _cases(fn):
+    combos = [{}]
+    for argnames, values in fn.__dict__.get("_cases", []):
+        nxt = []
+        for c in combos:
+            for v in values:
+                v = v if len(argnames) > 1 else (v,)
+                nxt.append(dict(c, **dict(zip(argnames, v))))
+        combos = nxt
+    return combos
+
+
+def _method(fn, kwargs):
+    def run(self):
+        call = dict(kwargs)
+        if "tmp_path" in fn.__code__.co_varnames[:fn.__code__.co_argcount]:
+            with tempfile.TemporaryDirectory() as d:
+                call["tmp_path"] = pathlib.Path(d)
+                fn(**call)
+        else:
+            fn(**call)
+    return run
+
+
+for _name, _fn in list(globals().items()):
+    if _name.startswith("test_") and callable(_fn):
+        _fn.__test__ = False   # collected through DetachedLaunchTest only, also under pytest
+        for _i, _kw in enumerate(_cases(_fn)):
+            _label = "_".join("".join(ch if ch.isalnum() else "_" for ch in str(v))[:40] for v in _kw.values())
+            setattr(DetachedLaunchTest, "{}_{}{}".format(_name, _i, "_" + _label if _label else ""), _method(_fn, _kw))
+del _name, _fn
+
+
+if __name__ == "__main__":
+    unittest.main()
