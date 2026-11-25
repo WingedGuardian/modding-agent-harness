@@ -34,10 +34,11 @@ Known limits:
 - A flag built at run time (arithmetic, a variable holding 8, a helper's keyword argument) or a launch inside a script
   the command only names is not seen; code generated inside Python string literals is not read.
 - Helpers started with pythonw or a .pyw are not reported (also console-less; some legitimate helpers run that way).
-- judge() judges a Write on its first 4,000,000 characters (judge_text and judge_patch have no cap); the words of a
-  command past its first 20,000 are read as text only.
-- A variable command word after a prefix is read as an interpreter, so its -e / -p / -c value is judged as code:
-  `timeout 30 "$RG" -e 'creationflags=8' src` is reported (a search for the flag text through a variable).
+- Size: judge() cuts a Write's content at 4,000,000 characters, and an Edit to a file over 4,000,000 bytes is judged
+  on its new text alone. Nothing else is capped (an Edit's new text, NotebookEdit, judge_text, judge_patch). The
+  words of a command past its first 20,000 are read as text only.
+- A variable command word is read as an interpreter, so its -e / -p / -c value is judged as code:
+  `"$RG" -e 'creationflags=8' src` is reported (a search for the flag text through a variable).
 - A patch with more than 2,000 hunks, or whose hunks take over 5 s to place in the file, is judged hunk by hunk.
 - An interpreter's option is assumed to take at most one value (`python -B script.py -c` reads -c as python's).
 - Node `detached: true` is reported anywhere in JS/TS code, a test asserting it is absent included.
@@ -95,7 +96,7 @@ INLINE = re.compile(r"(?im)" + INTERP_TOKEN +
                     r"(?:\s+(?:-{1,2}[\w.-]+(?:\s+(?![-/\"'])[^\s\"';|&]+)?|/[a-z]))*?\s+"
                     r"(?:-\w*c|-e|-p|--eval|--print|-Command|/c|/k)\s+(\"(?:[^\"\\]|\\.)*\"|'[^']*')")
 WINDOW = 200          # lines judged on each side of an edit
-MAX_FILE = 4_000_000  # bytes; a bigger file is judged on the new text only
+MAX_FILE = 4_000_000  # an edited file over this many bytes is judged on the new text only; a Write is cut at it (chars)
 MAX_JOIN = 50         # physical lines one statement may span
 
 
@@ -458,7 +459,8 @@ def judge_shell(command):
 def judge(tool, inp, exempt=EXEMPT, cwd=""):
     """The offending statement for this Claude Code-shaped call (TOOL and its input dict INP), or None.
     Shell tools (Bash, PowerShell, Monitor) are read as text and as words; file tools on code files only, a relative
-    path read against CWD."""
+    path read against CWD (a native-OS str or path; any other type is ignored)."""
+    cwd = os.fspath(cwd) if isinstance(cwd, (str, os.PathLike)) else ""
     path = str(_resolve(inp.get("file_path") or inp.get("notebook_path") or "", cwd)).replace("\\", "/")
     if tool in ("Bash", "PowerShell", "Monitor"):
         command = inp.get("command")

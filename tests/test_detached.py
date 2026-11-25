@@ -2,8 +2,9 @@
 shell-word tests.
 
 The tables and edit tests are the reviewed packet's (skyrimvr-save-guard-ci 23918cc); the rest were written in the four
-review rounds of the Skyrim AI Assistant Toolkit v4.3.0, which shipped this detector. They are kept verbatim from
-there and run under unittest: `parametrize` makes one test method per case and `tmp_path` is a fresh directory.
+review rounds of the Skyrim AI Assistant Toolkit v4.3.0, which shipped this detector. Their bodies are kept from there
+(two timing tests renamed, one patch test given a directory); the tests after "core API" are the core's own. They run
+under unittest: `parametrize` makes one test method per case and `tmp_path` is a fresh directory.
 """
 import pathlib
 import sys
