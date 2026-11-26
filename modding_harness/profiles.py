@@ -19,6 +19,11 @@ def comparison_key(resolved):
     return os.path.normcase(resolved)
 
 
+#: The longest POSIX PATH_MAX (Linux 4096; macOS 1024). A longer path string is refused by the
+#: kernel (ENAMETOOLONG) before any lookup, so it never names a file, symlinks included.
+_POSIX_PATH_MAX = 4096
+
+
 def _resolved(path):
     """Keep native resolution while bounding probes of a deeply missing tail.
 
@@ -28,8 +33,16 @@ def _resolved(path):
     retains junction/dangling-link semantics; the absent tail is appended once.
     Other errors, dot-parent and embedded-colon semantics use the original
     resolver unchanged.
+
+    POSIX realpath rebuilds the growing prefix for every component, so its cost
+    is quadratic in the path's length (issue #16). A path string longer than
+    `_POSIX_PATH_MAX` cannot be opened at all, so its lexical spelling is the
+    only meaningful answer and costs one pass. Shorter paths, which are the
+    only ones the OS can open, keep native resolution unchanged.
     """
     original = os.fspath(path)
+    if os.name != "nt" and len(original) > _POSIX_PATH_MAX:
+        return os.path.normpath(os.path.abspath(original))
     value = Path(path)
     parts = value.parts
     _drive, tail = os.path.splitdrive(original)
