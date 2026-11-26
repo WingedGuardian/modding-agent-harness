@@ -1,6 +1,7 @@
 """Game-owned membership rules; adding a game does not change preservation."""
 from __future__ import annotations
 
+import errno
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,9 +20,58 @@ def comparison_key(resolved):
     return os.path.normcase(resolved)
 
 
-#: The longest POSIX PATH_MAX (Linux 4096; macOS 1024). A longer path string is refused by the
-#: kernel (ENAMETOOLONG) before any lookup, so it never names a file, symlinks included.
-_POSIX_PATH_MAX = 4096
+#: Errors after which POSIX non-strict realpath appends every later component lexically: the
+#: component is absent (ENOENT), its parent is not a directory (ENOTDIR), or the resolved prefix
+#: or one name is too long to look up (ENAMETOOLONG). Without `..` the resolved prefix only
+#: grows, so once one prefix fails this way every longer one fails too.
+_POSIX_MISSING = (errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG)
+
+
+def _resolved_posix(original):
+    """POSIX: native resolution, linear in the length of a missing tail (issue #16).
+
+    `posixpath.realpath` rebuilds the growing prefix and lstats it for every
+    component, so a long path costs time quadratic in its length. Strict native
+    probes (a binary search) find the first component realpath would treat as
+    absent; the prefix up to and including it is resolved natively, so every
+    symlink in the existing part is still followed, and the rest is appended
+    once, exactly as realpath appends it. `..` (resolved against the physical
+    prefix), short paths, any other error, and a boundary that exists after all
+    (a symlink target containing `missing/..`) use the native resolver unchanged.
+    """
+    value = Path(original)
+    if not value.is_absolute():
+        value = Path.cwd() / value
+    parts = value.parts
+    if len(parts) < 32 or ".." in parts:
+        return str(Path(original).resolve())
+
+    def missing(error):
+        return isinstance(error, OSError) and error.errno in _POSIX_MISSING
+
+    try:
+        return str(value.resolve(strict=True))
+    except (OSError, RuntimeError) as error:
+        if not missing(error):
+            return str(value.resolve())
+    low, high = 1, len(parts)             # parts[:high] fails as missing; parts[:low] resolves
+    while high - low > 1:
+        middle = (low + high) // 2
+        try:
+            Path(*parts[:middle]).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            if not missing(error):
+                return str(value.resolve())
+            high = middle
+        else:
+            low = middle
+    boundary = Path(*parts[:high]).resolve()
+    if os.path.lexists(boundary):
+        # The strict failure was inside a symlink target (e.g. `missing/..`), which
+        # non-strict realpath walks past lexically into an existing folder; later
+        # components may then exist, so only the native resolver is exact.
+        return str(value.resolve())
+    return str(boundary.joinpath(*parts[high:]))
 
 
 def _resolved(path):
@@ -32,17 +82,11 @@ def _resolved(path):
     locate its first missing component, whose ordinary non-strict resolution
     retains junction/dangling-link semantics; the absent tail is appended once.
     Other errors, dot-parent and embedded-colon semantics use the original
-    resolver unchanged.
-
-    POSIX realpath rebuilds the growing prefix for every component, so its cost
-    is quadratic in the path's length (issue #16). A path string longer than
-    `_POSIX_PATH_MAX` cannot be opened at all, so its lexical spelling is the
-    only meaningful answer and costs one pass. Shorter paths, which are the
-    only ones the OS can open, keep native resolution unchanged.
+    resolver unchanged. POSIX has its own bounded branch, `_resolved_posix`.
     """
     original = os.fspath(path)
-    if os.name != "nt" and len(original) > _POSIX_PATH_MAX:
-        return os.path.normpath(os.path.abspath(original))
+    if os.name != "nt" and isinstance(original, str):
+        return _resolved_posix(original)
     value = Path(path)
     parts = value.parts
     _drive, tail = os.path.splitdrive(original)
