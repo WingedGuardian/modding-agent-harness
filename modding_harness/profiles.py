@@ -65,7 +65,10 @@ def _resolved_posix(original):
             high = middle
         else:
             low = middle
-    boundary = Path(*parts[:high]).resolve()
+    try:
+        boundary = Path(*parts[:high]).resolve()
+    except (OSError, RuntimeError):       # e.g. 3.11/3.12 raise on a loop inside the boundary
+        return str(value.resolve())
     if os.path.lexists(boundary):
         # The strict failure was inside a symlink target (e.g. `missing/..`), which
         # non-strict realpath walks past lexically into an existing folder; later

@@ -52,7 +52,7 @@ class PosixLongPathTests(unittest.TestCase):
             os.close(fd)
 
         def remove_over():
-            # TemporaryDirectory cleanup cannot remove a tree past PATH_MAX by full paths.
+            # Explicit, so the cleanup never depends on rmtree's handling of a tree past PATH_MAX.
             def walk(fd, depth):
                 if depth < 25:
                     child = os.open("p" * 200, os.O_RDONLY, dir_fd=fd)
@@ -87,8 +87,11 @@ class PosixLongPathTests(unittest.TestCase):
             "symlink target holding missing/..": self.root / "L" / "sav" / tail / "s.ess",
             "dot-parent after a symlink (native path)":
                 str(self.root / "savelink") + "/" + "x/../" * 1000 + "s.ess",
-            "relative": os.path.relpath(self.root / "savelink", os.getcwd()) + "/" + "r/" * 600,
+            "relative": "savelink/" + "r/" * 600,     # read against the cwd, set below
         }
+        here = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, here)
         for name, value in shapes.items():
             with self.subTest(name):
                 self.same_as_native(value)
@@ -116,11 +119,12 @@ class PosixLongPathTests(unittest.TestCase):
                 calls.append(strict)
                 return real(value, strict=strict)
 
-            with self.subTest(name), patch.object(Path, "resolve", resolve):
-                result = profiles.canonical(target)
-            self.assertEqual(os.path.normcase(str(target)), result, name)
-            self.assertLessEqual(len(calls), 20, name)
-            self.assertEqual(1, sum(not strict for strict in calls), name)
+            with self.subTest(name):
+                with patch.object(Path, "resolve", resolve):
+                    result = profiles.canonical(target)
+                self.assertEqual(os.path.normcase(str(target)), result)
+                self.assertLessEqual(len(calls), 20)
+                self.assertEqual(1, sum(not strict for strict in calls))
 
     def test_cost_grows_linearly_with_a_missing_tail(self):
         # Quadratic is ~16x for 4x the length, linear ~4x (plus a log factor from the probes).
