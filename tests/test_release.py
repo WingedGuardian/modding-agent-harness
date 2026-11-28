@@ -203,6 +203,28 @@ class CheckTests(Base):
 
 
 class FetchTests(Base):
+    def test_fetch_restores_only_the_executable_bits_of_unix_members(self):
+        members = {}
+        for name, system, mode in (("executable", 3, 0o4710), ("ordinary", 3, 0o644), ("dos", 0, 0o755)):
+            item = zipfile.ZipInfo("toolkit-4.3.0/bin/" + name)
+            item.create_system = system
+            item.external_attr = (stat.S_IFREG | mode) << 16
+            members[name] = item
+        changed = {}
+        chmod = Path.chmod
+
+        def remember(path, mode):
+            changed[path.name] = mode
+            chmod(path, mode)
+
+        with mock.patch.object(Path, "chmod", remember):
+            result = release.fetch(self.root, profile(), FakeGitHub(body=make_zip(extra=members)), environ=self.env)
+        self.assertEqual(set(changed), {"executable"})
+        self.assertEqual(changed["executable"] & 0o7111, 0o110)
+        if os.name != "nt":
+            executable = Path(result["source"]) / "bin" / "executable"
+            self.assertEqual(executable.stat().st_mode & 0o7111, 0o110)
+
     def test_a_verified_release_is_unpacked_aside_and_nothing_installed_changes(self):
         before = self.installed_bytes()
         out = release.fetch(self.root, profile(), FakeGitHub())
